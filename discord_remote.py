@@ -7,7 +7,7 @@ import asyncio
 from datetime import datetime
 
 # --- KONFIGURATION ---
-TOKEN = "MTQ3MDc5MzA3NjkzODExNzIwNw.Ggbgkl.wQjju3ONIaBLz1YMoIk6arPdsiaDF8vZJojAQc"
+TOKEN = "mycosde"
 CHANNEL_ID = 1470792864928763906  # ID deines Discord-Kanals (Rechtsklick auf Kanal -> ID kopieren)
 SETTINGS_FILE = "settings.json"
 MONITOR_FILE = "monitor.json"
@@ -211,5 +211,6 @@ async def on_ready():
     print(f"🎮 Bot Online: {bot.user}")
     if not main_loop.is_running():
         main_loop.start()
+
 
 bot.run(TOKEN)
