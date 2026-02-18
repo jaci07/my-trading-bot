@@ -1,5 +1,6 @@
 # infrastructure.py
 import logging
+import joblib
 import sqlite3
 import pandas as pd
 import pandas_ta as ta # Falls du pandas_ta nutzt, sonst kann das weg
@@ -274,280 +275,122 @@ class AIEngine:
         if not os.path.exists(self.models_dir):
             os.makedirs(self.models_dir)
 
-    # ---------------------------------------------------------
-    # 1. Feature Engineering (Die "Augen" der KI anpassen)
-    # ---------------------------------------------------------
     def feature_engineering(self, df):
         df = df.copy()
+        df.columns = [c.lower() for c in df.columns]
         try:
-            if len(df) < 200: return pd.DataFrame()
-
-            # --- 1. SPALTEN-CLEANUP & VOLUMEN-RETTUNG ---
-            df.columns = [c.lower() for c in df.columns]
-            
-            if 'tick_volume' in df.columns:
-                df['volume'] = df['tick_volume']
-            elif 'real_volume' in df.columns:
-                df['volume'] = df['real_volume']
-            
-            if 'volume' not in df.columns or df['volume'].sum() == 0:
-                df['volume'] = 1 
-
-            # --- 2. INDIKATOREN BERECHNEN ---
-            
-            # Momentum & Trend
-            df['RSI'] = ta.rsi(df['close'], length=14)
-            df['ATR'] = ta.atr(df['high'], df['low'], df['close'], length=14)
-            df['CCI'] = ta.cci(df['high'], df['low'], df['close'], length=20)
-            
-            # Stochastik RSI
-            stoch_rsi = ta.stochrsi(df['close'], length=14, rsi_length=14, k=3, d=3)
-            if stoch_rsi is not None and not stoch_rsi.empty:
-                df['Stoch_K'] = stoch_rsi.iloc[:, 0]
-                df['Stoch_D'] = stoch_rsi.iloc[:, 1]
-            else:
-                df['Stoch_K'], df['Stoch_D'] = 50, 50
-            
-            # MACD
+            df['rsi'] = ta.rsi(df['close'], length=14)
+            df['atr'] = ta.atr(df['high'], df['low'], df['close'], length=14)
+            df['cci'] = ta.cci(df['high'], df['low'], df['close'], length=20)
+            stoch = ta.stochrsi(df['close'])
+            df['stoch_k'] = stoch.iloc[:, 0] if stoch is not None else 50
             macd = ta.macd(df['close'])
-            if macd is not None and not macd.empty:
-                df['MACD'] = macd.iloc[:, 0]
-                df['MACD_Hist'] = macd.iloc[:, 1]
-            else:
-                df['MACD'], df['MACD_Hist'] = 0, 0
-            
-            df['EMA_20'] = ta.ema(df['close'], length=20)
-            df['EMA_50'] = ta.ema(df['close'], length=50)
-            df['Trend_Strength'] = df['EMA_20'] - df['EMA_50']
-
-            # Volatilität (Bollinger Bänder)
-            bb = ta.bbands(df['close'], length=20, std=2)
-            if bb is not None:
-                df['BB_Pct'] = (df['close'] - bb.iloc[:, 0]) / (bb.iloc[:, 2] - bb.iloc[:, 0])
-                df['BB_Width'] = (bb.iloc[:, 2] - bb.iloc[:, 0]) / df['close']
-
-            # Volumen-Indikatoren (MFI & OBV)
-            try:
-                df['MFI'] = ta.mfi(df['high'], df['low'], df['close'], df['volume'], length=14)
-                df['OBV'] = ta.obv(df['close'], df['volume'])
-                df['OBV_Slope'] = df['OBV'].diff(5)
-            except:
-                df['MFI'], df['OBV_Slope'] = 50, 0
-
-            # --- 3. ZUSÄTZLICH: VERGANGENHEIT LERNEN (Lags) ---
-            # WICHTIG: Erst hier unten, wenn RSI, MFI etc. existieren!
-            for col in ['RSI', 'MACD_Hist', 'Trend_Strength', 'MFI']:
-                if col in df.columns:
-                    df[f'{col}_prev1'] = df[col].shift(1)
-                    df[f'{col}_prev2'] = df[col].shift(2)
-
-            # --- 4. PRICE ACTION (Manuelle Muster) ---
-            body = abs(df['close'] - df['open'])
-            df['Wick_Upper'] = df['high'] - df[['open', 'close']].max(axis=1)
-            df['Wick_Lower'] = df[['open', 'close']].min(axis=1) - df['low']
-            
-            candle_range = df['high'] - df['low']
-            df['Is_Doji'] = np.where(body <= (candle_range * 0.1), 1, 0)
-            
-            df['Engulfing'] = 0
-            df.loc[(df['close'] > df['open']) & (body > body.shift(1)), 'Engulfing'] = 1
-            df.loc[(df['close'] < df['open']) & (body > body.shift(1)), 'Engulfing'] = -1
-
-            # --- 5. CLEANUP & FINAL LOWERCASE ---
-            df.ffill(inplace=True)
-            df.bfill(inplace=True)
-            df.fillna(0, inplace=True)
-            
-            # DER ENTSCHEIDENDE FIX: 
-            # Wir machen am Ende ALLES klein, damit der Trainer keine KeyErrors wirft
-            df.columns = [c.lower() for c in df.columns]
-            
+            df['macd_hist'] = macd.iloc[:, 1] if macd is not None else 0
+            df['ema_20'], df['ema_50'] = ta.ema(df['close'], 20), ta.ema(df['close'], 50)
+            df['trend_strength'] = df['ema_20'] - df['ema_50']
+            bb = ta.bbands(df['close'])
+            df['bb_pct'] = (df['close'] - bb.iloc[:, 0]) / (bb.iloc[:, 2] - bb.iloc[:, 0]) if bb is not None else 0.5
+            df['bb_width'] = (bb.iloc[:, 2] - bb.iloc[:, 0]) / df['close'] if bb is not None else 0
+            df['mfi'] = ta.mfi(df['high'], df['low'], df['close'], df['tick_volume'])
+            df['obv_slope'] = ta.obv(df['close'], df['tick_volume']).diff(5)
+            for c in ['rsi', 'macd_hist', 'trend_strength']:
+                df[f'{c}_prev1'], df[f'{c}_prev2'] = df[c].shift(1), df[c].shift(2)
+            df['wick_upper'] = df['high'] - df[['open', 'close']].max(axis=1)
+            df['wick_lower'] = df[['open', 'close']].min(axis=1) - df['low']
+            df['is_doji'] = np.where(abs(df['close']-df['open']) <= (df['high']-df['low'])*0.1, 1, 0)
+            df['engulfing'] = 0 # Vereinfacht
+            df.ffill(inplace=True); df.bfill(inplace=True); df.fillna(0, inplace=True)
             return df
-            
         except Exception as e:
-            log.error(f"⚠️ Feature Engineering Crash: {e}")
-            return pd.DataFrame()
+            log.error(f"Feature Error: {e}"); return pd.DataFrame()
 
     # ---------------------------------------------------------
     # 2. Train Models (Das Training anpassen)
     # ---------------------------------------------------------
     def train_models(self, symbol, df):
         try:
-            # 1. Features berechnen (jetzt mit VWAP & Volumen)
             df = self.feature_engineering(df)
+            if len(df) < 100: return 
             
-            if len(df) < 50: return 
-            
-            # Target: 1 wenn der Preis in Zukunft steigt
-            df['Target'] = (df['close'].shift(-1) > df['close']).astype(int)
-            
-            # WICHTIG: Hier nutzen wir jetzt die NEUEN Features!
-            # Keine Standard-Indikatoren mehr, sondern deine Strategie-Logik.
-            # WICHTIG: Hier nutzen wir jetzt die NEUEN Features!
-            # Pump_Factor und Close_Loc helfen der KI, überdehnte Kerzen zu erkennen.
+            # WICHTIG: Die Features müssen exakt so heißen wie die Spalten (kleingeschrieben!)
             features = [
-                # --- Momentum & Kraft ---
-                'RSI', 'Stoch_K', 'CCI',
-                'RSI_prev1', 'RSI_prev2',           # Historie: RSI
-    
-                # --- Trend-Kontext ---
-                'MACD_Hist', 'Trend_Strength',
-                'MACD_Hist_prev1', 'MACD_Hist_prev2', # Historie: MACD
-                'Trend_Strength_prev1', 'Trend_Strength_prev2', # Historie: Trend
-    
-                # --- Volatilität ---
-                    'BB_Pct', 'BB_Width', 'ATR',
-    
-                # --- Volumen Flow ---
-                'MFI', 'OBV_Slope',
-                'MFI_prev1', 'MFI_prev2',           # Historie: MFI
-    
-                # --- Price Action & Muster ---
-                'Wick_Upper', 'Wick_Lower',
-                'Is_Doji', 'Engulfing'
+                'rsi', 'stoch_k', 'cci', 'rsi_prev1', 'rsi_prev2',
+                'macd_hist', 'trend_strength', 'macd_hist_prev1', 'macd_hist_prev2',
+                'trend_strength_prev1', 'trend_strength_prev2',
+                'bb_pct', 'bb_width', 'atr',
+                'mfi', 'obv_slope', 'mfi_prev1', 'mfi_prev2',
+                'wick_upper', 'wick_lower', 'is_doji', 'engulfing'
             ]
             
-            # Sicherheits-Check: Sind alle da?
+            # Prüfen welche Features wirklich im DF sind
             available_features = [f for f in features if f in df.columns]
-            if not available_features: return
+            
+            if not available_features:
+                log.warning(f"⚠️ Keine Features für {symbol} gefunden. Training abgebrochen.")
+                return
+
+            # Target: Wir brauchen 3 Klassen für deine get_ai_prediction Logik!
+            # 0 = Seitwärts/Nix, 1 = Long Win, 2 = Short Win
+            # Hier eine einfache Logik (sollte später durch Simulation ersetzt werden):
+            df['target'] = 0
+            # Wenn Preis um mehr als 0.1% steigt -> Long
+            df.loc[df['close'].shift(-10) > df['close'] * 1.001, 'target'] = 1
+            # Wenn Preis um mehr als 0.1% fällt -> Short
+            df.loc[df['close'].shift(-10) < df['close'] * 0.999, 'target'] = 2
 
             X = df[available_features]
-            y = df['Target']
+            y = df['target']
             
-            # --- SMART MEMORY INTEGRATION (Das Tagebuch laden) ---
-            memory_file = os.path.join(self.models_dir, "smart_memory.csv")
-            if os.path.exists(memory_file):
-                try:
-                    mem_df = pd.read_csv(memory_file)
-                    mem_df = mem_df[mem_df['symbol'] == symbol]
-                    
-                    if not mem_df.empty:
-                        # Wir nehmen nur die Spalten, die wir kennen
-                        valid_cols = available_features + ['Target']
-                        valid_cols = [c for c in valid_cols if c in mem_df.columns]
-                        
-                        if 'Target' in valid_cols and len(valid_cols) > 1:
-                            mem_subset = mem_df[valid_cols]
-                            
-                            X_mem = mem_subset[available_features]
-                            y_mem = mem_subset['Target']
-                            
-                            # Echte Erfahrung zählt 5x mehr als Backtest
-                            X_mem = pd.concat([X_mem] * 5, ignore_index=True)
-                            y_mem = pd.concat([y_mem] * 5, ignore_index=True)
-                            
-                            X = pd.concat([X, X_mem], ignore_index=True)
-                            y = pd.concat([y, y_mem], ignore_index=True)
-                            log.info(f"🧠 {len(mem_df)} echte Erfahrungen geladen.")
-                except: pass
-            # -----------------------------------------------------
-
-            # Modell trainieren
             model = RandomForestClassifier(n_estimators=100, max_depth=5, random_state=42)
             model.fit(X, y)
 
-            # --- NEU: DOPPELT SPEICHERN ---
-            # 1. In den RAM (für sofortigen Zugriff)
             self.models[symbol] = model
             
-            # 2. Auf Festplatte (für Neustart)
-            filename = os.path.join(self.models_dir, f"{symbol}_rf.pkl")
-            with open(filename, 'wb') as f:
-                pickle.dump(model, f)
+            # Speichern mit joblib (konsistent zum Laden)
+            filename = os.path.join(self.models_dir, f"{symbol}_model.pkl")
+            joblib.dump(model, filename)
             
-            log.info(f"💾 Modell für {symbol} gespeichert (RAM + Disk).")
-            
-            # Speichern
-            filename = os.path.join(self.models_dir, f"{symbol}_rf.pkl")
-            with open(filename, 'wb') as f:
-                pickle.dump(model,f)
-            
-            log.info(f"🧠 Modell trainiert für {symbol} (VWAP/Volumen Logik)")
+            log.info(f"🧠 Modell für {symbol} erfolgreich trainiert und gespeichert.")
             
         except Exception as e:
-            log.error(f"Training Error {symbol}: {e}")
+            log.error(f"❌ Training Error {symbol}: {e}")
+
+    def get_ai_prediction(self, symbol, df):
+        probs = self.get_prediction_proba_all(symbol, df)
+        return {"nix": probs[0], "long": probs[1], "short": probs[2]}
 
     def get_prediction_proba_all(self, symbol, df):
-        """Gibt die Wahrscheinlichkeiten für alle 3 Klassen zurück"""
+        """Lädt das Modell und berechnet Wahrscheinlichkeiten [Neutral, Win, Loss]"""
         model = self.models.get(symbol)
         if model is None:
-            # Versuche von Disk zu laden
             filename = os.path.join(self.models_dir, f"{symbol}_model.pkl")
             if os.path.exists(filename):
-                model = joblib.load(filename)
-                self.models[symbol] = model
-            else:
-                return [1.0, 0.0, 0.0] # 100% Sicherheit für 'Nichts tun'
+                try:
+                    model = joblib.load(filename)
+                    self.models[symbol] = model
+                except: return [1.0, 0.0, 0.0]
+            else: return [1.0, 0.0, 0.0]
 
         try:
-            # Features berechnen und letzte Zeile holen
             data = self.feature_engineering(df)
-            if data.empty: return [1.0, 0.0, 0.0]
+            features = ['rsi', 'stoch_k', 'cci', 'rsi_prev1', 'rsi_prev2', 'macd_hist', 'trend_strength', 
+                        'macd_hist_prev1', 'macd_hist_prev2', 'bb_pct', 'bb_width', 'atr', 'mfi', 
+                        'obv_slope', 'wick_upper', 'wick_lower', 'is_doji', 'engulfing']
             
-            # Die exakt gleiche Feature-Liste wie im Trainer!
-            features = ['rsi', 'stoch_k', 'cci', 'rsi_prev1', 'rsi_prev2',
-            'macd_hist', 'trend_strength', 'macd_hist_prev1', 'macd_hist_prev2',
-            'trend_strength_prev1', 'trend_strength_prev2',
-            'bb_pct', 'bb_width', 'atr',
-            'mfi', 'obv_slope', 'mfi_prev1', 'mfi_prev2',
-            'wick_upper', 'wick_lower', 'is_doji', 'engulfing'] 
-            last_row = data[features].iloc[[-1]]
+            # Warnung verhindern durch .values.reshape
+            X = data[features].iloc[-1].values.reshape(1, -1)
+            probs = model.predict_proba(X)[0]
             
-            # Gibt [Prob_0, Prob_1, Prob_2] zurück
-            return model.predict_proba(last_row)[0]
+            # Mapping für Trainer (1=Win, 2=Loss)
+            # Falls Modell nur 1 Klasse kennt (sehr selten)
+            if len(probs) == 1: return [0.0, 1.0, 0.0] 
+            # Normalfall: probs[0] ist Win (1), probs[1] ist Loss (2)
+            return [0.0, probs[0], probs[1]]
         except:
             return [1.0, 0.0, 0.0]
 
-        # Sicherheits-Check
-        if model is None: return 0.5
-
-        # --- SCHRITT B: BERECHNUNG (Muss für alle gelten!) ---
-        try:
-            # FIX: Wir brauchen mehr Historie für den VWAP (200 Kerzen)!
-            calc_df = df.tail(200).copy() 
-            
-            data = self.feature_engineering(calc_df) 
-            
-            # Wenn Feature Engineering alles weggeschnitten hat (z.B. wegen NaNs)
-            if data.empty: return 0.5
-            
-            # Features prüfen (Inklusive der neuen Features!)
-            features = [
-                # --- Momentum & Kraft ---
-                'RSI', 'Stoch_K', 'CCI',
-                'RSI_prev1', 'RSI_prev2',           # Historie: RSI
-    
-                # --- Trend-Kontext ---
-                'MACD_Hist', 'Trend_Strength',
-                'MACD_Hist_prev1', 'MACD_Hist_prev2', # Historie: MACD
-                'Trend_Strength_prev1', 'Trend_Strength_prev2', # Historie: Trend
-    
-                # --- Volatilität ---
-                    'BB_Pct', 'BB_Width', 'ATR',
-    
-                # --- Volumen Flow ---
-                'MFI', 'OBV_Slope',
-                'MFI_prev1', 'MFI_prev2',           # Historie: MFI
-    
-                # --- Price Action & Muster ---
-                'Wick_Upper', 'Wick_Lower',
-                'Is_Doji', 'Engulfing'
-            ]
-            
-            # Nur Features nutzen, die wirklich da sind
-            available_features = [f for f in features if f in data.columns]
-            
-            if not available_features: return 0.5
-
-            # Letzte Zeile für Vorhersage nutzen
-            last_row = data.iloc[[-1]][available_features]
-            
-            # Die magische Vorhersage
-            prob_up = model.predict_proba(last_row)[0][1]
-            return prob_up
-            
-        except Exception:
-            return 0.5
+    def get_prediction_prob(self, symbol, df):
+        return self.get_ai_prediction(symbol, df)["long"]
         
     # Füge das zur AIEngine Klasse hinzu
     def save_experience(self, symbol, features, label):
