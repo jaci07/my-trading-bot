@@ -1,4 +1,13 @@
 # main.py
+import warnings
+import os
+
+# --- SILENCE THE NOISE ---
+# Diese Filter müssen VOR allen anderen Importen stehen!
+warnings.filterwarnings("ignore")
+os.environ["PYTHONWARNINGS"] = "ignore"
+
+# main.py
 import time
 import sys
 from datetime import datetime
@@ -6,7 +15,6 @@ import pytz
 import pandas as pd
 #import yfinance as yf 
 import json
-import os
 from mt5_handler import MT5Handler
 from infrastructure import DatabaseHandler, VolumeProfileEngine, AIEngine, log, timedelta
 from risk_manager import RiskManager
@@ -14,7 +22,12 @@ from settings import cfg
 import numpy as np
 from advanced_engine import AdvancedMarketEngine # <--- NEU
 import joblib
+# Unterdrückt die nervigen Parallel-Warnungen
+warnings.filterwarnings("ignore", category=UserWarning, module="sklearn.utils.parallel")
+warnings.filterwarnings("ignore", message=".*sklearn.utils.parallel.delayed.*")
 
+# Optional: Unterdrückt TensorFlow/System Warnungen falls vorhanden
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 
 class EnterpriseBot:
     def __init__(self):
@@ -48,12 +61,12 @@ class EnterpriseBot:
         self.tz_ny = pytz.timezone('America/New_York')
         self.last_heartbeat = 0
     
-    def get_current_features(self, df):
+    def get_current_features(self, df_m5):
         """Extrahiert die nackten Zahlen, die die AI sieht"""
-        df_feat = self.ai.feature_engineering(df.copy())
-        if df_feat.empty: return {}
+        df_m5_feat = self.ai.feature_engineering(df_m5.copy())
+        if df_m5_feat.empty: return {}
         
-        last_row = df_feat.iloc[-1].to_dict()
+        last_row = df_m5_feat.iloc[-1].to_dict()
         clean_features = {k: v for k, v in last_row.items() if isinstance(v, (int, float))}
         return clean_features
 
@@ -192,42 +205,39 @@ class EnterpriseBot:
         except Exception as e:
             log.error(f"Fehler in execute_trade: {e}")
 
-    def fetch_candles(self, symbol):
-        """Holt historische Daten DIREKT aus MT5"""
-        timeframe = self.mt5.mt5.TIMEFRAME_M5 
+    def fetch_candles(self, symbol, timeframe=None):
+        """Holt historische Daten DIREKT aus MT5 für den gewünschten Timeframe"""
+        # Wenn kein Timeframe angegeben wird, nimm automatisch M5
+        if timeframe is None:
+            timeframe = self.mt5.mt5.TIMEFRAME_M5 
+            
         rates = self.mt5.mt5.copy_rates_from_pos(symbol, timeframe, 0, 500)
         
         if rates is None or len(rates) == 0: return None
         
-        df = pd.DataFrame(rates)
-        df['time'] = pd.to_datetime(df['time'], unit='s')
-        df.rename(columns={'tick_volume': 'volume'}, inplace=True)
-        df.set_index('time', inplace=True)
-        return df
+        df_m5 = pd.DataFrame(rates)
+        df_m5['time'] = pd.to_datetime(df_m5['time'], unit='s')
+        df_m5.rename(columns={'tick_volume': 'volume'}, inplace=True)
+        df_m5.set_index('time', inplace=True)
+        return df_m5
 
     def manage_running_trades(self):
-
         """
         Verwaltet offene Trades.
-        NEU: Der 'Night Guard' schließt alles um 22:55 Uhr UTC.
+        NEU: Night Guard und korrigiertes, dynamisches Smart Trailing.
         """
         positions = self.mt5.mt5.positions_get()
         if not positions: return
 
         # --- NIGHT GUARD: ZWANGS-SCHLIESSUNG VOR ROLLOVER ---
-        # Wir schließen kurz vor 23:00 Uhr (22:55), um dem Spread-Wahnsinn zu entkommen.
         now_utc = datetime.utcnow()
-        
-        # Wenn es zwischen 22:55 und 04:00 Uhr ist -> ALLES SCHLIESSEN
         is_rollover_time = (now_utc.hour == 21 and now_utc.minute >= 59) or \
                            (now_utc.hour >= 22) or \
                            (now_utc.hour < 3)
                            
         if is_rollover_time:
             log.warning(f"🌙 NIGHT GUARD: Es ist {now_utc.strftime('%H:%M')} UTC. Schließe alle Positionen vor der Nacht-Pause!")
-            
             for pos in positions:
-                # Close Request erstellen
                 request = {
                     "action": self.mt5.mt5.TRADE_ACTION_DEAL,
                     "symbol": pos.symbol,
@@ -239,24 +249,13 @@ class EnterpriseBot:
                     "type_time": self.mt5.mt5.ORDER_TIME_GTC,
                     "type_filling": self.mt5.mt5.ORDER_FILLING_IOC,
                 }
-                
                 result = self.mt5.mt5.order_send(request)
-                if result.retcode != self.mt5.mt5.TRADE_RETCODE_DONE:
-                    log.error(f"❌ Fehler beim Schließen von {pos.symbol}: {result.comment}")
-                else:
+                if result.retcode == self.mt5.mt5.TRADE_RETCODE_DONE:
                     log.info(f"✅ {pos.symbol} sicher geschlossen (Spread-Schutz).")
-            
-            return # Funktion hier beenden, keine Trailing-Stops mehr nötig
+            return 
 
-        """
-        SMART TRAILING V2: Basiert auf dem FORTSCHRITT ZUM TP (in %).
-        - 20% des Weges geschafft -> Break Even.
-        - 50% des Weges geschafft -> Smart Trailing an LVA.
-        """
+        # --- SMART TRAILING V2 ---
         try:
-            positions = self.mt5.mt5.positions_get()
-            if positions is None or len(positions) == 0: return
-
             for pos in positions:
                 symbol = pos.symbol
                 tick = self.mt5.mt5.symbol_info_tick(symbol)
@@ -268,105 +267,86 @@ class EnterpriseBot:
                 current_sl = pos.sl
                 tp_price = pos.tp
 
-                # --- HIER NEU: CHECK REVERSE ---
-                # Prüfen, ob wir drehen müssen
+                # Reverse Check
                 if self.check_stop_and_reverse(pos, current_price, symbol):
-                    continue # Wenn gedreht wurde, ist der alte Trade weg -> Loop weiter
-                # -------------------------------
+                    continue 
                 
-                # Wenn kein TP gesetzt ist, können wir keinen Fortschritt berechnen -> Fallback
                 if tp_price == 0: continue
 
-                # Daten für Smart Structure (LVA) holen
-                candles = self.mt5.copy_rates_from_pos(symbol, self.mt5.mt5.TIMEFRAME_M5, 0, 500)
-                lva = None
-                if candles is not None:
-                    df_trail = pd.DataFrame(candles)
-                    # Nur einfache LVA Berechnung ohne Zeit-Konvertierung um CPU zu sparen
-                    # (Die Logik ist im VolumeProfileEngine, hier nur Vorbereitung)
-                    pass
-
-                # --- FORTSCHRITT BERECHNEN ---
-                # Wie weit sind wir vom Einstieg entfernt?
                 dist_now = abs(current_price - open_price)
-                # Wie weit ist der TP entfernt?
                 dist_total = abs(tp_price - open_price)
+                if dist_total == 0: continue 
                 
-                if dist_total == 0: continue # Sicherheit
-                
-                # Fortschritt in Prozent (0.50 = 50% des Weges)
                 progress = dist_now / dist_total
                 
-                # Puffer für SL (kleiner Abstand zum Preis)
-                BUFFER = current_price * 0.0003 
+                # FIX: Dynamischer Puffer basierend auf Punktewert (funktioniert bei JPY, EUR, Krypto)
+                point = self.mt5.mt5.symbol_info(symbol).point
+                BUFFER = point * 30 # 30 Points = exakt 3 Pips Abstand
+
+                # LVA vorbereiten (Nur wenn über 50%, spart CPU)
+                lva = None
+                if progress >= 0.50:
+                    candles = self.mt5.copy_rates_from_pos(symbol, self.mt5.mt5.TIMEFRAME_M5, 0, 500)
+                    if candles is not None:
+                        df_m5_trail = pd.DataFrame(candles)
+                        # FIX: Profil MUSS für dieses Symbol berechnet werden!
+                        self.vp_engine.calculate_enhanced_profile(df_m5_trail)
+                        direction_lva = "DOWN" if pos.type == self.mt5.mt5.ORDER_TYPE_BUY else "UP"
+                        lva = self.vp_engine.find_nearest_lva(df_m5_trail, current_price, direction=direction_lva)
 
                 # ===========================
-                # LONG TRADES
+                # LONG TRADES (pos.type == 0)
                 # ===========================
-                if pos.type == self.mt5.mt5.ORDER_TYPE_BUY:
-                    # Nur wenn wir im Plus sind
-                    if current_price > open_price:
+                if pos.type == self.mt5.mt5.ORDER_TYPE_BUY and current_price > open_price:
+                    
+                    # 1. Break Even
+                    if progress >= 0.20 and current_sl < open_price:
+                        new_sl = open_price + (point * 10) # 1 Pip Profit sichern
+                        self.mt5.modify_position(pos.ticket, new_sl, pos.tp)
+                        log.info(f"🛡️ {symbol} LONG: 20% erreicht -> Break Even.")
+                        continue
+
+                    # 2. Smart Trailing
+                    if progress >= 0.50:
+                        lock_pct = 0.30 if progress < 0.70 else 0.55
                         
-                        # STUFE 1: BREAK EVEN ab 20% Fortschritt (Wie von dir gewünscht!)
-                        # Wir sichern ab, sobald der Trade "anläuft".
-                        if progress >= 0.20 and current_sl < open_price:
-                            new_sl = open_price + (open_price * 0.0002) # Ein kleines bisschen Profit sichern (Gebühren)
-                            self.mt5.modify_position(pos.ticket, new_sl, pos.tp)
-                            log.info(f"🛡️ {symbol}: 20% Ziel erreicht! SL auf Break Even gezogen.")
-                            continue
+                        if lva and open_price < lva < current_price:
+                            smart_sl = lva - BUFFER
+                        else:
+                            smart_sl = open_price + (dist_now * lock_pct)
 
-                        # STUFE 2: SMART TRAILING ab 50% Fortschritt
-                        # Jetzt wollen wir Gewinne laufen lassen, aber eng absichern.
-                        if progress >= 0.50:
-                            # Wir suchen das nächste LVA unter uns
-                            if candles is not None:
-                                df_trail['close'] = candles['close'] # Quick fix
-                                lva = self.vp_engine.find_nearest_lva(df_trail, current_price, direction="DOWN")
-                            
-                            # Wenn LVA gefunden und sinnvoll:
-                            if lva and lva > open_price and lva < current_price:
-                                smart_sl = lva - BUFFER
-                            else:
-                                # Fallback: Wir sichern 30% des Gewinns
-                                smart_sl = open_price + (dist_now * 0.30)
-
-                            # Nur ändern, wenn der neue SL besser (höher) ist
-                            if smart_sl > current_sl and smart_sl < current_price:
-                                # Mindestabstand einhalten (damit wir MT5 nicht spammen)
-                                if (smart_sl - current_sl) > (current_price * 0.0002):
-                                    self.mt5.modify_position(pos.ticket, smart_sl, pos.tp)
-                                    log.info(f"🧱 {symbol}: Smart SL nachgezogen auf {smart_sl:.5f} ({progress*100:.1f}% Fortschritt)")
+                        # Update wenn neuer SL mind. 2 Pips besser ist
+                        if smart_sl > current_sl and (smart_sl - current_sl) > (point * 20):
+                            self.mt5.modify_position(pos.ticket, smart_sl, pos.tp)
+                            log.info(f"🧱 {symbol} LONG: Smart SL auf {smart_sl:.5f} ({progress*100:.0f}% Fortschritt)")
 
                 # ===========================
-                # SHORT TRADES
+                # SHORT TRADES (pos.type == 1)
                 # ===========================
-                elif pos.type == self.mt5.mt5.ORDER_TYPE_SELL:
-                    if current_price < open_price:
+                elif pos.type == self.mt5.mt5.ORDER_TYPE_SELL and current_price < open_price:
+                    
+                    # 1. Break Even
+                    if progress >= 0.20 and (current_sl > open_price or current_sl == 0):
+                        new_sl = open_price - (point * 10) # 1 Pip Profit sichern
+                        self.mt5.modify_position(pos.ticket, new_sl, pos.tp)
+                        log.info(f"🛡️ {symbol} SHORT: 20% erreicht -> Break Even.")
+                        continue
+
+                    # 2. Smart Trailing
+                    if progress >= 0.50:
+                        lock_pct = 0.30 if progress < 0.70 else 0.55
                         
-                        # STUFE 1: BREAK EVEN ab 20%
-                        if progress >= 0.20 and (current_sl > open_price or current_sl == 0):
-                            new_sl = open_price - (open_price * 0.0002)
-                            self.mt5.modify_position(pos.ticket, new_sl, pos.tp)
-                            log.info(f"🛡️ {symbol}: 20% Ziel erreicht! SL auf Break Even gezogen.")
-                            continue
+                        if lva and current_price < lva < open_price:
+                            smart_sl = lva + BUFFER
+                        else:
+                            # FIX: Minus rechnen bei Short!
+                            smart_sl = open_price - (dist_now * lock_pct)
 
-                        # STUFE 2: SMART TRAILING ab 50%
-                        if progress >= 0.50:
-                            if candles is not None:
-                                df_trail['close'] = candles['close']
-                                lva = self.vp_engine.find_nearest_lva(df_trail, current_price, direction="UP")
-                            
-                            if lva and lva < open_price and lva > current_price:
-                                smart_sl = lva + BUFFER
-                            else:
-                                # Fallback: 30% des Gewinns sichern
-                                smart_sl = open_price - (dist_now * 0.30)
+                        # Update wenn neuer SL mind. 2 Pips tiefer (besser) ist
+                        if (current_sl == 0 or smart_sl < current_sl) and (current_sl == 0 or (current_sl - smart_sl) > (point * 20)):
+                            self.mt5.modify_position(pos.ticket, smart_sl, pos.tp)
+                            log.info(f"🧱 {symbol} SHORT: Smart SL auf {smart_sl:.5f} ({progress*100:.0f}% Fortschritt)")
 
-                            # Nur ändern, wenn der neue SL besser (tiefer) ist
-                            if (current_sl == 0 or smart_sl < current_sl) and smart_sl > current_price:
-                                if (current_sl == 0) or (current_sl - smart_sl) > (current_price * 0.0002):
-                                    self.mt5.modify_position(pos.ticket, smart_sl, pos.tp)
-                                    log.info(f"🧱 {symbol}: Smart SL nachgezogen auf {smart_sl:.5f} ({progress*100:.1f}% Fortschritt)")
         except Exception as e:
             log.error(f"Fehler im Trailing: {e}")
 
@@ -693,219 +673,163 @@ class EnterpriseBot:
                     time.sleep(60)
                     continue
                 
+                # ============================================================
                 # 3. SCANNING LOOP
+                # ============================================================
                 for symbol in cfg.SYMBOLS:
                     try:
-                        # Grundlegende Daten holen
-                        df = self.fetch_candles(symbol)
-                        if df is None or df.empty: continue
+                        # --- 0. PRE-CHECK: DISCORD ---
+                        quick_settings = self.load_settings()
+                        if quick_settings:
+                            if not quick_settings.get("trading_active", True) or \
+                               quick_settings.get("status") != "running":
+                                log.info("⚡ Discord-Pause aktiv. Breche Scan ab...")
+                                break
 
-                        # 1. KI-Wahrscheinlichkeit sofort holen (für den Log)
-                        ai_prob = self.ai.get_prediction_prob(symbol, df)
+                        # --- DIAGNOSE START ---
+                        # print(f"Prüfe {symbol}...") # (Optional)
+                        
+                        if not self.is_asset_tradable_now(symbol): 
+                            print(f"🛑 {symbol}: Markt ist geschlossen.")
+                            continue
+                            
+                        if self.db.get_minutes_since_last_trade(symbol) < 15: 
+                            print(f"⏳ {symbol}: Cooldown läuft noch.")
+                            continue
+                        
+                        tick = self.mt5.mt5.symbol_info_tick(symbol)
+                        if not tick or tick.ask == 0: 
+                            print(f"❌ {symbol}: MT5 liefert keine Preise (Marktübersicht prüfen!)")
+                            continue
+                        
+                        spread_pips = (tick.ask - tick.bid) / self.mt5.mt5.symbol_info(symbol).point
+                        if spread_pips > 20.0: 
+                            print(f"📈 {symbol}: Spread zu hoch ({spread_pips:.1f}).")
+                            continue 
+
+                        # --- DATEN HOLEN (DUAL-TF) ---
+                        df_m5 = self.fetch_candles(symbol, timeframe=self.mt5.mt5.TIMEFRAME_M5)
+                        df_m1 = self.fetch_candles(symbol, timeframe=self.mt5.mt5.TIMEFRAME_M1)
+                        
+                        if df_m5 is None or df_m5.empty or df_m1 is None or df_m1.empty:
+                            print(f"📉 {symbol}: Keine Kerzendaten.")
+                            continue
+
                         bid, ask = self.mt5.get_live_price(symbol)
                         mid_price = (bid + ask) / 2 if bid else 0
 
-                        # 2. Technische Strategie prüfen
-                        direction, strategy_name = self.adv_engine.check_entry_signal(symbol, df, self.vp_engine)
+                        # --- 1. TECHNISCHE STRATEGIE (M5) ---
+                        direction, strategy_name = self.adv_engine.check_entry_signal(symbol, df_m5, self.vp_engine)
+                        strat_display = strategy_name if direction else "Wartend (Kein VAH/VAL Break)"
 
-                        # 3. JETZT LOGGEN (Bevor die continues kommen!)
-                        # So siehst du bei JEDEM Scan, was Sache ist
-                        log.info(f"🔎 [{symbol}] Preis:{mid_price:.2f} | AI:{ai_prob:.2f} | Strategie: {strategy_name}")
+                        # --- 2. KI BEFRAGEN FÜR LOGGING (M5) ---
+                        ai_m5 = self.ai.get_ai_prediction(symbol, df_m5, tf_name="M5")
+                        
+                        best_prob = max(ai_m5['long'], ai_m5['short'], ai_m5['nix'])
+                        if best_prob == ai_m5['long']: trend = "LONG"
+                        elif best_prob == ai_m5['short']: trend = "SHORT"
+                        else: trend = "NIX "
 
-                        # --- AB HIER DIE HARTE FILTERUNG ---
+                        print(f"🔎 [{symbol}] Preis:{mid_price:.5f} | AI-Trend ({trend}): {best_prob:.2f} | Strat: {strat_display}")
 
-                            # A) MARKT-FILTER (Velocity)
+                        # --- 3. MARKT-FILTER (Velocity) ---
                         velocity = self.adv_engine.get_tick_velocity(symbol)
                         if velocity > 8.0: 
                             continue
 
-                        # B) TECHNISCHES SETUP DA?
+                        # --- 4. TECHNISCHES SETUP DA? ---
                         if not direction:
                             continue 
-
-                        # C) KI-SCHWELLENWERT (Threshold)
-                        # KI Meinung abfragen
-                        ai_decision = self.ai.get_ai_prediction(symbol, df)
-    
-                        win_prob = ai_decision['long']  # Das ist unser 'Win' Score
-                        loss_prob = ai_decision['short'] # Das ist unser 'Loss' Score
-
-                        log.info(f"🔎 [{symbol}] Preis:{mid_price:.2f} | Win:{win_prob:.2f} | Loss:{loss_prob:.2f} | Strat: {strategy_name}")
-
-                        # --- DER SCHUTZ-FILTER ---
-                        # 1. Wenn die KI sagt "Nix tun" ist am wahrscheinlichsten -> ABBRUCH
-                        if ai_decision["nix"] > ai_decision["long"] and ai_decision["nix"] > ai_decision["short"]:
-                            continue
-
-                        # 2. Threshold prüfen (70%)
-                        THRESHOLD = 0.70
-                        if current_ai_score < THRESHOLD:
-                            continue
-
-                        if not is_ai_confirmed:
-                            # Optional: log.info(f"🛑 {symbol}: Setup ok, aber KI unsicher.")
-                            continue 
-
-                        # D) EXECUTION (Wird nur bei Volltreffer erreicht)
-                        log.info(f"🔥 VOLLTREFFER: {symbol} | {direction} | KI: {ai_prob:.2%}")
-                        self.execute_trade(symbol, direction, strategy_name, ai_prob)
-
-
                         
-                        # A) MARKET CHECK
-                        if not self.is_asset_tradable_now(symbol):
-                            # if is_debug_symbol: log.info(f"ℹ️ {symbol} ist laut Zeitplan geschlossen.")
+                        # --- 5. KI FÜR M1 BEFRAGEN & AUTO-TRAINING ---
+                        ai_m1 = self.ai.get_ai_prediction(symbol, df_m1, tf_name="M1")
+                        
+                        # Auto-Training (Wie von dir gewünscht)
+                        if ai_m5['long'] == 0.0 and ai_m5['short'] == 0.0 and ai_m5['nix'] == 1.0: 
+                            log.info(f"🧠 [{symbol}] Kein M5-Modell -> Lerne...")
+                            self.ai.train_models(symbol, df_m5)
+                            ai_m5 = self.ai.get_ai_prediction(symbol, df_m5, tf_name="M5") # Daten neu laden
+
+                        # --- 6. DER SCHUTZ-FILTER (Nix-Tun Check) ---
+                        if (ai_m5["nix"] > ai_m5["long"] and ai_m5["nix"] > ai_m5["short"]) or \
+                           (ai_m1["nix"] > ai_m1["long"] and ai_m1["nix"] > ai_m1["short"]):
+                            continue
+
+                        if direction == "LONG":
+                            score_m5, score_m1 = ai_m5['long'], ai_m1['long']
+                        else: 
+                            score_m5, score_m1 = ai_m5['short'], ai_m1['short']
+
+                        # --- 7. KI-SCHWELLENWERT (Dual-Threshold) ---
+                        THRESHOLD_M5, THRESHOLD_M1 = 0.60, 0.60 
+                        if score_m5 < THRESHOLD_M5 or score_m1 < THRESHOLD_M1:
                             continue
                         
-                        # B) COOLDOWN
-                        if self.db.get_minutes_since_last_trade(symbol) < 15:
-                            if is_debug_symbol: log.info(f"⏳ {symbol} Cooldown aktiv.")
-                            continue
-
-                        # D) LIVE PREIS (MT5)
-                        bid, ask = self.mt5.get_live_price(symbol)
-                        if bid is None: 
-                            if is_debug_symbol: log.warning(f"⚠️ {symbol}: MT5 liefert KEINEN PREIS! (Symbol im Marktbeobachter nicht aktiv?)")
-                            continue
-                        
-                        mid_price = (bid + ask) / 2
-                        
-                        # E) AI CHECK
-                        ai_prob = self.ai.get_prediction_prob(symbol, df)
-                        if ai_prob == 0.5: 
-                             log.info(f"🧠 [{symbol}] Kein Modell -> Lerne...")
-                             self.ai.train_models(symbol, df)
-                             ai_prob = self.ai.get_prediction_prob(symbol, df)
-
                         # ==========================================
-                        # 🧠 UPGRADE 2: SMART STRATEGY & AI FILTER
+                        # 🧠 UPGRADE 2: EXPERTEN-FILTER
                         # ==========================================
-                        # 1. Schritt: Prüfe die Volumen-Profile Logik (Sticky Protection, Momentum)
-                        # Wir übergeben das df und die vp_engine
-                        direction, strategy_name = self.adv_engine.check_entry_signal(symbol, df, self.vp_engine)
-
-                        if not direction:
-                            # Falls Sticky oder kein Momentum -> Weiter zum nächsten Symbol
-                            continue
-
-                        # 2. Schritt: Falls Strategie passt, frage die KI nach ihrer Meinung
-                        ai_prob = self.ai.get_prediction_prob(symbol, df)
-                        
-                        # Info Log für dich
-                        
-
-                        # 3. Schritt: Das Ausschlussverfahren (Threshold)
-                        # Wir traden nur, wenn Strategie UND KI-Sicherheit (z.B. 60%) stimmen
-                        MIN_CONFIDENCE = 0.60 
-
-                        if ai_prob < MIN_CONFIDENCE:
-                            #log.info(f"🛑 AI zu unsicher ({ai_prob:.2f} < {MIN_CONFIDENCE}). Skip.")
-                            continue
-
-                        # --- DER EXPERTEN-FILTER (Ausschlussverfahren) ---
-                        # Wir prüfen harte Fakten. Wenn einer nicht passt -> SKIP.
-
-                        current_rsi = df['RSI'].iloc[-1]
-                        current_mfi = df['MFI'].iloc[-1]
-                        bb_pct = df['BB_Pct'].iloc[-1] # >1 bedeutet Preis ist außerhalb der Bänder
+                        current_rsi = df_m5['RSI'].iloc[-1] if 'RSI' in df_m5 else 50
+                        current_mfi = df_m5['MFI'].iloc[-1] if 'MFI' in df_m5 else 50
+                        bb_pct = df_m5['BB_Pct'].iloc[-1] if 'BB_Pct' in df_m5 else 0.5
                 
-                        # 1. ÜBERKAUFT-SCHUTZ (Für LONG Trades)
-                        if signal['side'] == "LONG":
-                            # RSI über 75? Zu teuer.
+                        # 1. ÜBERKAUFT-SCHUTZ (Für LONG Trades) - FIX: Nutzt jetzt 'direction' statt 'signal'
+                        if direction == "LONG":
                             if current_rsi > 75:
                                 log.info(f"🛑 Filter: RSI zu hoch ({current_rsi:.1f}). Kein Long.")
                                 continue
-                    
-                            # Bollinger Band oben durchbrochen? Oft kommt ein Rücksetzer.
                             if bb_pct > 1.0:
                                 log.info(f"🛑 Filter: Preis über Bollinger Band. Warte Rücksetzer.")
                                 continue
-                        
-                            # MFI (Smart Money) Divergenz? 
-                            # Preis steigt, aber Geld fließt ab (MFI < 40)?
                             if current_mfi < 40:
                                 log.warning(f"🛑 Filter: Kein Volumen-Support (MFI {current_mfi:.1f}).")
                                 continue
 
                         # 2. ÜBERVERKAUFT-SCHUTZ (Für SHORT Trades)
-                        elif signal['side'] == "SHORT":
-                            # RSI unter 25? Zu billig.
+                        elif direction == "SHORT":
                             if current_rsi < 25:
                                 log.info(f"🛑 Filter: RSI zu tief ({current_rsi:.1f}). Kein Short.")
                                 continue
-                        
-                            # Bollinger Band unten durchbrochen?
                             if bb_pct < 0.0:
                                 log.info(f"🛑 Filter: Preis unter Bollinger Band. Warte Pullback.")
                                 continue
-                        
                             if current_mfi > 60:
                                 log.warning(f"🛑 Filter: Zuviel Kaufdruck im Volumen (MFI {current_mfi:.1f}).")
                                 continue
 
                         # 3. DOJI-SCHUTZ (Unsicherheit)
-                        if df['Is_Doji'].iloc[-1] == 1:
+                        if 'Is_Doji' in df_m5 and df_m5['Is_Doji'].iloc[-1] == 1:
                             log.info("🛑 Filter: Letzte Kerze war ein Doji (Unsicherheit). Kein Trade.")
                             continue
 
                         # WENN WIR HIER SIND: Alle Filter bestanden! ✅
 
-                        # --- NEU: SMART ANCHOR & ATR LOGIK ---
-                        
-                        # 1. ATR berechnen (für dynamische Toleranz)
+                        # --- SMART ANCHOR & ATR LOGIK ---
                         try:
-                            # Versuch pandas_ta (falls installiert)
-                            current_atr = df.ta.atr(length=14).iloc[-1]
+                            current_atr = df_m5.ta.atr(length=14).iloc[-1]
                         except:
-                            # Fallback: Einfache High-Low Differenz
-                            current_atr = (df['high'] - df['low']).tail(14).mean()
+                            current_atr = (df_m5['high'] - df_m5['low']).tail(14).mean()
 
-                        # 2. Anker finden (Wo startete der Trend?)
-                        # Das Profil wird jetzt dynamisch berechnet, nicht mehr starr 96 Kerzen
-                        anchor_idx = self.vp_engine.find_last_pivot(df)
-                        df_anchored = df.loc[anchor_idx:]
-                        
-                        # Fallback falls Anker zu nah ist (<10 Kerzen) -> Nimm 24h
-                        if len(df_anchored) < 10: df_anchored = df.tail(96)
+                        anchor_idx = self.vp_engine.find_last_pivot(df_m5)
+                        df_m5_anchored = df_m5.loc[anchor_idx:]
+                        if len(df_m5_anchored) < 10: df_m5_anchored = df_m5.tail(96)
 
-                        # 3. Profil berechnen
-                        poc, vah, val = self.vp_engine.calculate_enhanced_profile(df_anchored)
-                        vwap = self.vp_engine.calculate_vwap(df)
-                        
-                        # Dynamische Toleranz (statt festen 0.3%)
+                        poc, vah, val = self.vp_engine.calculate_enhanced_profile(df_m5_anchored)
+                        vwap = self.vp_engine.calculate_vwap(df_m5)
                         zone_tolerance = current_atr * 0.5
 
-                        if poc == 0: 
-                            if is_debug_symbol: log.warning(f"⚠️ {symbol}: Volumen-Profil ist 0.")
-                            continue
-
-                        # F) INFO AUSGABE (Endlich!)
-                        log.info(f"🔎 [{symbol}] Preis:{mid_price:.2f} | AI:{ai_prob:.2f} | POC:{poc:.2f}")
+                        log.info(f"🔎 [{symbol}] Filter bestanden | M5-AI:{score_m5:.2f} | M1-AI:{score_m1:.2f} | POC:{poc:.2f}")
 
                         signal = None
-                        short_prob = 1.0 - ai_prob
+                        
+                        # Widerstände für TP/SL finden
+                        swing_high_major = df_m5['high'].iloc[-50:].max()
+                        swing_low_major = df_m5['low'].iloc[-50:].min()
+                        lva_below = self.vp_engine.find_nearest_lva(df_m5, mid_price, direction="DOWN")
+                        lva_above = self.vp_engine.find_nearest_lva(df_m5, mid_price, direction="UP")
 
-                       # --- STRATEGIE LOGIK (SMART RESISTANCE TARGETING) ---
-                        
-                        AI_LIMIT = 0.60
-                        MIN_RRR = 1  # Trade lohnt sich erst ab hier
-                        MAX_RRR = 2.5  # Alles darüber ist oft unrealistisch ("Gier-Bremse")
-
-                        recent_close = df['close'].iloc[-1]
-                        
-                        # Wir scannen nach Widerständen (für Longs) und Supports (für Shorts)
-                        # 1. Lokale Swing-Highs/Lows der letzten 50 Kerzen
-                        swing_high_major = df['high'].iloc[-50:].max()
-                        swing_low_major = df['low'].iloc[-50:].min()
-                        
-                        # 2. Volume Profile Levels (POC, VAH, VAL) sind auch Magneten
-                        
-                        lva_below = self.vp_engine.find_nearest_lva(df, mid_price, direction="DOWN")
-                        lva_above = self.vp_engine.find_nearest_lva(df, mid_price, direction="UP")
-
-                        # --- SMART SL LOGIK (Bleibt unverändert - Schutz hinter Struktur) ---
+                        # INLINE FUNKTIONEN (Wie von dir gewünscht)
                         def get_smart_sl(side, entry, lva, swing):
-                            MAX_SL_DIST = entry * 0.0035 # Etwas mehr Luft geben
+                            MAX_SL_DIST = entry * 0.0035 
                             candidate_sl = swing 
                             use_lva = (side=="LONG" and lva and lva<entry) or (side=="SHORT" and lva and lva>entry)
                             if use_lva: candidate_sl = lva
@@ -916,215 +840,162 @@ class EnterpriseBot:
                                 else: candidate_sl = entry + MAX_SL_DIST
                             return candidate_sl
 
-
-                        # --- NEU: INTELLIGENTE ZIEL-SUCHE (RESISTANCE FINDER) ---
                         def get_logical_tp(side, entry, sl):
                             risk = abs(entry - sl)
                             if risk == 0: return entry + (entry*0.001)
-
-                            # Alle möglichen Ziele sammeln
                             candidates = []
                             
                             if side == "LONG":
-                                # Ziele OBEN: Swing Highs, VAH, POC
                                 if swing_high_major > entry: candidates.append(swing_high_major)
                                 if vah > entry: candidates.append(vah)
                                 if poc > entry: candidates.append(poc)
-                                # Fallback: Einfach 2R
                                 candidates.append(entry + (risk * 2.0))
-                                candidates.sort() # Das nächste Ziel zuerst
-
-                            else: # SHORT
-                                # Ziele UNTEN: Swing Lows, VAL, POC
+                                candidates.sort() 
+                            else: 
                                 if swing_low_major < entry: candidates.append(swing_low_major)
                                 if val < entry: candidates.append(val)
                                 if poc < entry: candidates.append(poc)
                                 candidates.append(entry - (risk * 2.0))
-                                candidates.sort(reverse=True) # Das nächste Ziel zuerst (von oben nach unten)
+                                candidates.sort(reverse=True) 
 
-                            # Das BESTE Ziel auswählen
                             best_tp = None
-                            
                             for target in candidates:
                                 reward = abs(target - entry)
                                 rrr = reward / risk
-                                
-                                # LOGIK: Nimm das erste Ziel, das "lohnenswert" ist (> 1.5 RRR)
-                                # Aber nicht, wenn es astronomisch weit weg ist (> 4.0 RRR)
-                                if rrr >= MIN_RRR and rrr <= MAX_RRR:
+                                if 1 <= rrr <= 2.5: # MIN_RRR und MAX_RRR direkt hier
                                     best_tp = target
-                                    break # Gefunden! Wir nehmen den ersten (nächsten) Widerstand der passt.
+                                    break 
                             
-                            # Wenn gar kein Ziel passt (alle zu nah oder zu weit), nimm Standard 2.0
                             if best_tp is None:
                                 if side == "LONG": best_tp = entry + (risk * 2.0)
                                 else: best_tp = entry - (risk * 2.0)
-                                
                             return best_tp
 
                         # --- SETUP SUCHE ---
+                        recent_close = df_m5['close'].iloc[-1]
 
                         # 1. SETUP: VAH Breakout
                         if recent_close > (vah + zone_tolerance) and recent_close > vwap:
-                            if ai_prob > AI_LIMIT:
-                                if not self.db.has_traded_today(symbol, "VAH_Break"):
-                                    sl_price = vah - zone_tolerance
-                                    final_sl = get_smart_sl("LONG", mid_price, lva_below, sl_price)
-                                    
-                                    if final_sl:
-                                        # Hier wird jetzt intelligent gesucht!
-                                        final_tp = get_logical_tp("LONG", mid_price, final_sl)
-                                        signal = {"side": "LONG", "tp": final_tp, "sl": final_sl, "setup": "VAH_Break_Smart"}
+                            if not self.db.has_traded_today(symbol, "VAH_Break"):
+                                sl_price = vah - zone_tolerance
+                                final_sl = get_smart_sl("LONG", mid_price, lva_below, sl_price)
+                                if final_sl:
+                                    final_tp = get_logical_tp("LONG", mid_price, final_sl)
+                                    signal = {"side": "LONG", "tp": final_tp, "sl": final_sl, "setup": "VAH_Break_Smart"}
 
                         # 2. SETUP: VAL Rejection
-                        elif (val - zone_tolerance) < df['low'].iloc[-1] < (val + zone_tolerance) and recent_close > val:
-                            if ai_prob > AI_LIMIT:
-                                if not self.db.has_traded_today(symbol, "VAL_Rej"):
-                                     sl_price = df['low'].iloc[-1] - zone_tolerance
-                                     final_sl = get_smart_sl("LONG", mid_price, lva_below, sl_price)
-                                     
-                                     if final_sl:
-                                         final_tp = get_logical_tp("LONG", mid_price, final_sl)
-                                         signal = {"side": "LONG", "tp": final_tp, "sl": final_sl, "setup": "VAL_Rej_Smart"}
+                        elif (val - zone_tolerance) < df_m5['low'].iloc[-1] < (val + zone_tolerance) and recent_close > val:
+                            if not self.db.has_traded_today(symbol, "VAL_Rej"):
+                                 sl_price = df_m5['low'].iloc[-1] - zone_tolerance
+                                 final_sl = get_smart_sl("LONG", mid_price, lva_below, sl_price)
+                                 if final_sl:
+                                     final_tp = get_logical_tp("LONG", mid_price, final_sl)
+                                     signal = {"side": "LONG", "tp": final_tp, "sl": final_sl, "setup": "VAL_Rej_Smart"}
 
                         # 3. SETUP: VAH Rejection (Short)
-                        elif (vah - zone_tolerance) < df['high'].iloc[-1] < (vah + zone_tolerance) and recent_close < vah:
-                            if (1 - ai_prob) > AI_LIMIT:
-                                if not self.db.has_traded_today(symbol, "VAH_Rej"):
-                                    sl_price = df['high'].iloc[-1] + zone_tolerance
-                                    final_sl = get_smart_sl("SHORT", mid_price, lva_above, sl_price)
-                                    
-                                    if final_sl:
-                                        final_tp = get_logical_tp("SHORT", mid_price, final_sl)
-                                        signal = {"side": "SHORT", "tp": final_tp, "sl": final_sl, "setup": "VAH_Rej_Smart"}
+                        elif (vah - zone_tolerance) < df_m5['high'].iloc[-1] < (vah + zone_tolerance) and recent_close < vah:
+                            if not self.db.has_traded_today(symbol, "VAH_Rej"):
+                                sl_price = df_m5['high'].iloc[-1] + zone_tolerance
+                                final_sl = get_smart_sl("SHORT", mid_price, lva_above, sl_price)
+                                if final_sl:
+                                    final_tp = get_logical_tp("SHORT", mid_price, final_sl)
+                                    signal = {"side": "SHORT", "tp": final_tp, "sl": final_sl, "setup": "VAH_Rej_Smart"}
 
                         # 4. SETUP: POC Bounce
                         elif abs(mid_price - poc) < zone_tolerance:
-                            if df['low'].iloc[-1] <= poc and recent_close > poc and mid_price > vwap:
-                                if ai_prob > AI_LIMIT and not self.db.has_traded_today(symbol, "POC_Bounce_Long"):
+                            if df_m5['low'].iloc[-1] <= poc and recent_close > poc and mid_price > vwap:
+                                if not self.db.has_traded_today(symbol, "POC_Bounce_Long"):
                                     final_sl = get_smart_sl("LONG", mid_price, lva_below, poc - zone_tolerance)
                                     if final_sl:
                                         final_tp = get_logical_tp("LONG", mid_price, final_sl)
                                         signal = {"side": "LONG", "tp": final_tp, "sl": final_sl, "setup": "POC_Bounce_Smart"}
                             
-                            elif df['high'].iloc[-1] >= poc and recent_close < poc and mid_price < vwap:
-                                if (1-ai_prob) > AI_LIMIT and not self.db.has_traded_today(symbol, "POC_Bounce_Short"):
+                            elif df_m5['high'].iloc[-1] >= poc and recent_close < poc and mid_price < vwap:
+                                if not self.db.has_traded_today(symbol, "POC_Bounce_Short"):
                                     final_sl = get_smart_sl("SHORT", mid_price, lva_above, poc + zone_tolerance)
                                     if final_sl:
                                         final_tp = get_logical_tp("SHORT", mid_price, final_sl)
                                         signal = {"side": "SHORT", "tp": final_tp, "sl": final_sl, "setup": "POC_Bounce_Smart"}
 
-                        
                         # --- EXECUTION ---
                         if signal:
-                            # 1. HIER IST DER FIX: Variable vor-definieren!
                             shares = 0 
-                            
                             valid_sl = False
                             if signal['side'] == "LONG" and signal['sl'] < mid_price: valid_sl = True
                             if signal['side'] == "SHORT" and signal['sl'] > mid_price: valid_sl = True
                             
                             if not valid_sl: continue
 
-                            # Profit Check (Minimum 0.15% muss drin sein)
                             profit_potential = abs(signal['tp'] - mid_price)
                             min_profit = mid_price * 0.0015 
-                            
-                            if profit_potential < min_profit: 
-                                valid_sl = False
+                            if profit_potential < min_profit: valid_sl = False
 
                             if valid_sl:
-                                # Info Log mit neuem RRR
                                 risk_dist = abs(mid_price - signal['sl'])
                                 rrr = profit_potential / risk_dist if risk_dist > 0 else 0
 
-                                # --- SPREAD SCHUTZ ---
-                                tick = self.mt5.mt5.symbol_info_tick(symbol)
-                                if tick:
-                                    current_spread = (tick.ask - tick.bid)
-                                    point = self.mt5.mt5.symbol_info(symbol).point
-                                    spread_pips = current_spread / point
-                                    
-                                    MAX_SPREAD_PIPS = 30.0
-                                    
-                                    if spread_pips > MAX_SPREAD_PIPS:
-                                        log.warning(f"🛑 {symbol}: Spread zu hoch ({spread_pips:.1f} Pips). Trade blockiert!")
-                                        continue 
-                                # --- ENDE SPREAD SCHUTZ ---
-                                
                                 log.info(f"🚀 SIGNAL: {symbol} {signal['side']} | RRR: {rrr:.2f} | TP: {signal['tp']:.5f}")
                                 
-                                # Hier wird shares berechnet
                                 shares = self.risk_manager.calculate_position_size(symbol, mid_price, signal['sl'])
                             else:
-                                log.warning(f"⚠️ {symbol}: Ungültiger SL oder zu wenig Profit ({signal['sl']}). Trade übersprungen.") 
-                                # shares bleibt hier einfach 0, stürzt aber nicht mehr ab!
+                                log.warning(f"⚠️ {symbol}: Ungültiger SL oder zu wenig Profit. Übersprungen.") 
 
-                            # Jetzt existiert 'shares' auf jeden Fall (entweder berechnet oder 0)
                             if shares > 0:
-                                # Order absenden
+                                avg_score = (score_m5 + score_m1) / 2
+                                log.info(f"🔥 DUAL-VOLLTREFFER: {symbol} | {signal['setup']} | KI-Score: {avg_score:.2%}")
+                                
                                 success = self.mt5.submit_order(symbol, signal['side'], shares, signal['sl'], signal['tp'], signal['setup'])
                                     
                                 if success:
+                                    # 👻 SHADOW TRADES STARTEN
+                                    try: current_atr = df_m5.ta.atr(length=14).iloc[-1]
+                                    except: current_atr = mid_price * 0.002
 
-                                    # ==========================================
-                                    # 👻 UPGRADE 2: SHADOW TRADES STARTEN
-                                    # ==========================================
-                                    # Wir berechnen die ATR für die Schatten-Trades
-                                    try:
-                                        current_atr = df.ta.atr(length=14).iloc[-1]
-                                    except: 
-                                        current_atr = mid_price * 0.002 # Fallback
-
-                                    current_features = self.ai.feature_engineering(df).iloc[-1].to_dict()    
+                                    current_features = self.ai.feature_engineering(df_m5).iloc[-1].to_dict()    
                                     self.adv_engine.spawn_shadow_trades(symbol, signal['side'], mid_price, current_atr, current_features)
-                                    # ==========================================
 
-                                    # 1. Snapshot der Situation
-                                    features = self.get_current_features(df)
+                                    features = self.get_current_features(df_m5)
                                         
-                                    # 2. TICKET NUMMER HOLEN
                                     ticket_id = 0
                                     try:
                                         time.sleep(0.5) 
                                         open_positions = self.mt5.mt5.positions_get(symbol=symbol)
-                                            
                                         if open_positions:
                                             newest_pos = sorted(open_positions, key=lambda x: x.ticket)[-1]
                                             ticket_id = newest_pos.ticket
                                     except Exception as e:
                                         log.warning(f"Konnte Ticket-ID für {symbol} nicht sofort finden: {e}")
 
-                                    # 3. Speichern
                                     self.db.log_trade(symbol, signal['side'], shares, mid_price, signal['setup'], features, ticket_id)
-                            
                     
                     except Exception as inner_error:
                         log.error(f"❌ Fehler bei {symbol}: {inner_error}")
                         continue 
-                    
-                    # ============================================================
+                        
+                # ============================================================
                 # 4. LIVE MONITORING (Für das Discord Dashboard)
                 # ============================================================
                 try:
-                    # Wir schreiben eine separate Datei, damit settings.json nicht blockiert wird
                     positions = self.mt5.mt5.positions_get()
                     open_trades_count = len(positions) if positions else 0
                     
                     acc = self.mt5.get_account()
+                    # Fallback falls 'gain_pct' aus dem oberen Teil der Datei nicht greifbar ist
+                    current_gain = gain_pct if 'gain_pct' in locals() else 0.0 
+                    
                     monitor_data = {
                         "equity": acc.equity,
                         "balance": acc.balance,
-                        "profit_today_pct": gain_pct if 'gain_pct' in locals() else 0.0,
+                        "profit_today_pct": current_gain,
                         "open_trades": open_trades_count,
                         "last_update": datetime.now().strftime("%H:%M:%S"),
-                        "symbol_active": symbol if 'symbol' in locals() else "Scan..."
+                        "symbol_active": "Scan beendet..."
                     }
                     
                     with open("monitor.json", "w") as f:
                         json.dump(monitor_data, f)
-                except:
-                    pass # Nicht schlimm, wenn es mal einen Tick nicht klappt
+                except Exception as mon_err:
+                    pass 
 
                 time.sleep(5) 
 
