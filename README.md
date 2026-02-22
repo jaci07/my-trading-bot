@@ -8,7 +8,7 @@ This repository houses a high-performance **algorithmic trading engine** designe
 
 * **Triple-Timeframe AI Consensus**
   The engine utilizes a hierarchical decision logic across three distinct timeframes:
-  * **M15 (Macro):** Establishes the institutional trend and structural market bias.
+  * **(Not implemented yet!)M15 (Macro):** Establishes the institutional trend and structural market bias.
   * **M5 (Execution):** Identifies specific volume setups such as VAH/VAL breakouts and rejections.
   * **M1 (Precision):** Acts as a high-speed volatility filter to pinpoint exact entry timing.
 
