@@ -338,7 +338,7 @@ class AdvancedMarketEngine:
                 recent_vol = df[vol_col].iloc[-1]
                 avg_vol = df[vol_col].tail(20).mean()
                 # Ein Ausbruch oder Abpraller ist nur valide, wenn das Volumen > Durchschnitt ist
-                vol_confirmed = recent_vol > (avg_vol * 1.1) 
+                vol_confirmed = recent_vol > (avg_vol * 0.85) 
             else:
                 vol_confirmed = True # Fallback falls keine Volumendaten
 
@@ -378,14 +378,14 @@ class AdvancedMarketEngine:
                     if vol_confirmed:
                         # Vakuum-Check: Haben wir Platz bis zum nächsten LVA-Widerstand?
                         lva_above = vp_engine.find_nearest_lva(df, current_price, direction="UP")
-                        if lva_above is None or (lva_above - current_price) > (atr * 1.5):
+                        if lva_above is None or (lva_above - current_price) > (atr * 0.8):
                             return "LONG", "Smart_VAH_Breakout_Confirmed"
                 
                 # 2. REJECTION (Abpraller nach unten)
                 prev_low = df['low'].iloc[-2]
                 if current_price < open_price and current_price < prev_low:
                     # Optimierung: Bestätigung durch "Pin-Bar" Charakter (Docht oben)
-                    if upper_wick > body:
+                    if upper_wick > (body * 0.5):
                         return "SHORT", "Smart_VAH_Rejection_Confirmed"
 
             # --- C) STRATEGIE: UNTERE KANTE (VAL) ---
@@ -395,14 +395,14 @@ class AdvancedMarketEngine:
                     # Optimierung: Volumen-Bestätigung für den Verkaufsdruck
                     if vol_confirmed:
                         lva_below = vp_engine.find_nearest_lva(df, current_price, direction="DOWN")
-                        if lva_below is None or (current_price - lva_below) > (atr * 1.5):
+                        if lva_below is None or (current_price - lva_below) > (atr * 0.8):
                             return "SHORT", "Smart_VAL_Breakout_Confirmed"
                 
                 # 2. REJECTION (Abpraller nach oben)
                 prev_high = df['high'].iloc[-2]
                 if current_price > open_price and current_price > prev_high:
                     # Optimierung: Bestätigung durch "Hammer" Charakter (Docht unten)
-                    if lower_wick > body:
+                    if lower_wick > (body * 0.5):
                         return "LONG", "Smart_VAL_Rejection_Confirmed"
 
             return None, None
