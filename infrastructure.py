@@ -160,23 +160,31 @@ class VolumeProfileEngine:
 
     def find_last_pivot(self, df):
         """
-        Sucht den Index des letzten signifikanten Pivot-Punktes (Swing High oder Low).
-        Dient als Startpunkt (Anchor) für die Berechnung des Volumenprofils.
+        Smarter Anchor: Looks back a full 24h (288 candles on M5) to find 
+        the true major structural swing high or low for the Volume Profile.
         """
-        if df is None or len(df) < 20:
+        if df is None or len(df) < 50:
             return df.index[0] if df is not None and not df.empty else 0
             
-        # Wir schauen uns die letzten 100 Kerzen an, um den Start des aktuellen Trends zu finden
-        lookback = min(100, len(df))
+        # 1. Expand lookback to ~1 full trading day (300 candles on M5)
+        lookback = min(600, len(df))
         recent_df = df.iloc[-lookback:]
         
-        # Finde den Index des extremsten Hochs und Tiefs in diesem Fenster
+        # 2. Find the absolute structural extremes in this broader window
         highest_idx = recent_df['high'].idxmax()
         lowest_idx = recent_df['low'].idxmin()
         
-        # Wir nehmen den Punkt, der weiter in der Vergangenheit liegt, 
-        # da von dort aus meist der aktuelle Move gestartet ist.
+        # 3. Anchor at the start of the CURRENT major move
         anchor_idx = min(highest_idx, lowest_idx)
+        
+        # 4. FAILSAFE: If the anchor is too close to the current price (< 20 candles),
+        # the profile will be uselessly thin. We flip the anchor to the OTHER extreme 
+        # to capture the entire leg that led to this recent peak/valley.
+        current_idx = len(df) - 1
+        if (current_idx - anchor_idx) < 20:
+            anchor_idx = max(highest_idx, lowest_idx)
+            
+        return anchor_idx
         
         return anchor_idx
 
