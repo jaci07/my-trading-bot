@@ -9,7 +9,7 @@ import sys
 # --- 1. EINSTELLUNGEN ---
 SYMBOL = "EURUSD"  
 THRESHOLD = 0.63    # KI Sicherheit
-RRR = 1.0           # Risk-Reward-Ratio 
+RRR = 1.5           # Risk-Reward-Ratio 
 SWING_PERIOD = 20   # Wie viele Kerzen zurück für den Smart SL?
 # ------------------------
 
@@ -91,8 +91,41 @@ def run_visualizer():
 
     df_merged = df_merged.reset_index(drop=True)
 
-    df_merged['Dual_Long'] = (df_merged['long_m5'] > THRESHOLD) & (df_merged['long_m1'] > THRESHOLD)
-    df_merged['Dual_Short'] = (df_merged['short_m5'] > THRESHOLD) & (df_merged['short_m1'] > THRESHOLD)
+
+    # --- NEU: Indikatoren für Experten-Filter aus df_m5_features holen ---
+    df_merged['rsi'] = df_m5_features['rsi']
+    df_merged['bb_pct'] = df_m5_features['bb_pct']
+    df_merged['is_doji'] = df_m5_features['is_doji']
+
+    df_merged['mfi'] = df_m5_features['mfi'] if 'mfi' in df_m5_features.columns else 50
+    # --- DER FIX: Experten-Filter aus main.py ---
+    
+    # 1. Basis KI-Signale (Dual-Threshold)
+    ki_long = (df_merged['long_m5'] > THRESHOLD) & (df_merged['long_m1'] > THRESHOLD)
+    ki_short = (df_merged['short_m5'] > THRESHOLD) & (df_merged['short_m1'] > THRESHOLD)
+
+    # 2. ÜBERKAUFT-SCHUTZ & Volumen-Filter (LONG)
+    long_filter = (
+        (df_merged['rsi'] <= 75) &      # Kein Long wenn stark überkauft
+        (df_merged['bb_pct'] <= 1.0) &  # Preis nicht über dem oberen Bollinger Band
+        (df_merged['mfi'] >= 40) &      # Ausreichend Kaufdruck im Volumen
+        (df_merged['is_doji'] == 0)     # Keine Unsicherheitskerze
+    )
+
+    # 3. ÜBERVERKAUFT-SCHUTZ & Volumen-Filter (SHORT)
+    short_filter = (
+        (df_merged['rsi'] >= 25) &      # Kein Short wenn stark überverkauft
+        (df_merged['bb_pct'] >= 0.0) &  # Preis nicht unter dem unteren Bollinger Band
+        (df_merged['mfi'] <= 60) &      # Nicht zu viel Kaufdruck im Volumen
+        (df_merged['is_doji'] == 0)     # Keine Unsicherheitskerze
+    )
+
+    # Finale Signale: KI-Wahrscheinlichkeit UND alle Filter müssen passen
+    df_merged['Dual_Long'] = ki_long & long_filter
+    df_merged['Dual_Short'] = ki_short & short_filter
+    
+    # Fallback für MFI, falls er im Feature-Set anders heißt
+    df_merged['mfi'] = df_m5_features['mfi'] if 'mfi' in df_m5_features.columns else 50
 
     print("⏱️ Simuliere Trades in der Zukunft (Backtest mit Smart SL)...")
     
