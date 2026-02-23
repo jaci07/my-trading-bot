@@ -312,9 +312,9 @@ class AdvancedMarketEngine:
     # ==========================================================
     def check_entry_signal(self, symbol, df, vp_engine):
         """
-        SMART ENTRY LOGIC V3 (Die 'Sticky' Protection)
+        SMART ENTRY LOGIC V3.1 (Optimiert mit Volume-Flow & Vacuum-Detection)
         Analysiert Rejections und Breakouts an VAH/VAL.
-        Verhindert Trades in klebrigen Konsolidierungen.
+        Verhindert Trades in klebrigen Konsolidierungen und Fake-Outs ohne Volumen.
         """
         try:
             if df is None or len(df) < 50: return None, None
@@ -327,43 +327,83 @@ class AdvancedMarketEngine:
             open_price = df['open'].iloc[-1]
             
             # Hilfsdaten für Momentum und Konsolidierung
-            # Wir brauchen ATR für Abstände (falls in df, sonst Notberechnung)
-            atr = df['ATR'].iloc[-1] if 'ATR' in df.columns else (df['high'].max() - df['low'].min()) * 0.05
+            # NEUE BERECHNUNG: Echte durchschnittliche Kerzengröße der letzten 14 Kerzen
+            atr = (df['high'].tail(14) - df['low'].tail(14)).mean()
             last_closes = df['close'].tail(5).tolist() 
 
-            # --- A) STICKY PROTECTION (Gegen Konsolidierung am Level) ---
-            # Wenn der Preis in den letzten 5 Kerzen schon 3x am Level war, ist es kein Abpraller mehr.
+            # --- OPTIMIERUNG: VOLUMEN-VALIDIERUNG ---
+            # Wir suchen die aktive Volumenspalte (tick_volume oder volume)
+            vol_col = next((c for c in ['tick_volume', 'volume', 'real_volume'] if c in df.columns), None)
+            if vol_col:
+                recent_vol = df[vol_col].iloc[-1]
+                avg_vol = df[vol_col].tail(20).mean()
+                # Ein Ausbruch oder Abpraller ist nur valide, wenn das Volumen > Durchschnitt ist
+                vol_confirmed = recent_vol > (avg_vol * 1.1) 
+            else:
+                vol_confirmed = True # Fallback falls keine Volumendaten
+
+            ''' --- A) STICKY PROTECTION (Gegen Konsolidierung am Level) ---
             touches_vah = sum(1 for p in last_closes if abs(p - vah) < (atr * 0.3))
             touches_val = sum(1 for p in last_closes if abs(p - val) < (atr * 0.3))
             
             if touches_vah >= 3 or touches_val >= 3:
-                # log.info(f"🛡️ {symbol}: Sticky am Level. Warte auf echten Ausbruch.")
+                log.info(f"🛡️ {symbol}: Sticky am Level. Warte auf echten Ausbruch.")
                 return None, None
+            '''
+
+            # --- A) STICKY PROTECTION ---
+            # Prüft, ob der Preis extrem eng am Level festklebt (Chop-Zone)
+            last_closes = df['close'].tail(6).tolist()
+            
+            # Wir verkleinern die "Klebe-Zone" drastisch (von 0.3 auf 0.1 ATR)
+            # Nur Kerzen, die FAST EXAKT auf der Linie schließen, zählen als "Sticky"
+            touches_vah = sum(1 for p in last_closes if abs(p - vah) <= (atr * 0.1))
+            touches_val = sum(1 for p in last_closes if abs(p - val) <= (atr * 0.1))
+            
+            # Wir fordern mehr Berührungen (4 von 6 statt 3 von 5)
+            if touches_vah >= 4 or touches_val >= 4:
+                log.info(f"🛡️ {symbol}: Level extrem klebrig. Warte auf klaren Ausbruch.")
+                return None, None
+
+            # Kerzen-Struktur für Rejection-Validierung (Dochte)
+            upper_wick = df['high'].iloc[-1] - max(open_price, current_price)
+            lower_wick = min(open_price, current_price) - df['low'].iloc[-1]
+            body = abs(current_price - open_price)
 
             # --- B) STRATEGIE: OBERE KANTE (VAH) ---
             if current_price >= (vah - (atr * 0.1)):
                 # 1. BREAKOUT (Momentum nach oben)
-                # Kerze ist GRÜN und schließt deutlich über VAH
                 if current_price > open_price and (current_price > vah + (atr * 0.1)):
-                    return "LONG", "Smart_VAH_Breakout"
+                    # Optimierung: Nur traden, wenn Volumen den Ausbruch stützt
+                    if vol_confirmed:
+                        # Vakuum-Check: Haben wir Platz bis zum nächsten LVA-Widerstand?
+                        lva_above = vp_engine.find_nearest_lva(df, current_price, direction="UP")
+                        if lva_above is None or (lva_above - current_price) > (atr * 1.5):
+                            return "LONG", "Smart_VAH_Breakout_Confirmed"
                 
                 # 2. REJECTION (Abpraller nach unten)
-                # Kerze ist ROT und schließt tiefer als das Tief der vorherigen Kerze (Momentum!)
                 prev_low = df['low'].iloc[-2]
                 if current_price < open_price and current_price < prev_low:
-                     return "SHORT", "Smart_VAH_Rejection"
+                    # Optimierung: Bestätigung durch "Pin-Bar" Charakter (Docht oben)
+                    if upper_wick > body:
+                        return "SHORT", "Smart_VAH_Rejection_Confirmed"
 
             # --- C) STRATEGIE: UNTERE KANTE (VAL) ---
             elif current_price <= (val + (atr * 0.1)):
                 # 1. BREAKOUT (Momentum nach unten)
                 if current_price < open_price and (current_price < val - (atr * 0.1)):
-                    return "SHORT", "Smart_VAL_Breakout"
+                    # Optimierung: Volumen-Bestätigung für den Verkaufsdruck
+                    if vol_confirmed:
+                        lva_below = vp_engine.find_nearest_lva(df, current_price, direction="DOWN")
+                        if lva_below is None or (current_price - lva_below) > (atr * 1.5):
+                            return "SHORT", "Smart_VAL_Breakout_Confirmed"
                 
                 # 2. REJECTION (Abpraller nach oben)
-                # Kerze ist GRÜN und schließt höher als das High der vorherigen Kerze
                 prev_high = df['high'].iloc[-2]
                 if current_price > open_price and current_price > prev_high:
-                    return "LONG", "Smart_VAL_Rejection"
+                    # Optimierung: Bestätigung durch "Hammer" Charakter (Docht unten)
+                    if lower_wick > body:
+                        return "LONG", "Smart_VAL_Rejection_Confirmed"
 
             return None, None
 
