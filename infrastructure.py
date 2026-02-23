@@ -158,6 +158,58 @@ class VolumeProfileEngine:
             if r['vol'] < threshold: return r['price']
         return None
 
+    def find_last_pivot(self, df):
+        """
+        Sucht den Index des letzten signifikanten Pivot-Punktes (Swing High oder Low).
+        Dient als Startpunkt (Anchor) für die Berechnung des Volumenprofils.
+        """
+        if df is None or len(df) < 20:
+            return df.index[0] if df is not None and not df.empty else 0
+            
+        # Wir schauen uns die letzten 100 Kerzen an, um den Start des aktuellen Trends zu finden
+        lookback = min(100, len(df))
+        recent_df = df.iloc[-lookback:]
+        
+        # Finde den Index des extremsten Hochs und Tiefs in diesem Fenster
+        highest_idx = recent_df['high'].idxmax()
+        lowest_idx = recent_df['low'].idxmin()
+        
+        # Wir nehmen den Punkt, der weiter in der Vergangenheit liegt, 
+        # da von dort aus meist der aktuelle Move gestartet ist.
+        anchor_idx = min(highest_idx, lowest_idx)
+        
+        return anchor_idx
+
+    def calculate_vwap(self, df):
+        """
+        Berechnet den Volume Weighted Average Price (VWAP) für das übergebene DataFrame.
+        """
+        if df is None or len(df) == 0:
+            return None
+            
+        # Typischer Preis: (High + Low + Close) / 3
+        typical_price = (df['high'] + df['low'] + df['close']) / 3
+        
+        # Welches Volumen haben wir? (tick_volume ist im MT5 Standard)
+        vol_col = 'tick_volume' if 'tick_volume' in df.columns else 'volume'
+        
+        # Falls absolut kein Volumen im Chart ist (sehr selten), Fallback auf normalen Preis
+        if vol_col not in df.columns:
+            return typical_price.iloc[-1]
+            
+        volume = df[vol_col]
+        
+        # VWAP Formel: Kumuliertes (Preis * Volumen) / Kumuliertes Volumen
+        cumulative_vp = (typical_price * volume).cumsum()
+        cumulative_volume = volume.cumsum()
+        
+        # Um eine Division durch 0 zu vermeiden
+        cumulative_volume = cumulative_volume.replace(0, 1)
+        
+        vwap = cumulative_vp / cumulative_volume
+        
+        # Wir geben den aktuellsten (letzten) VWAP-Wert zurück
+        return vwap.iloc[-1]
 # --- 4. AI ENGINE ---
 class AIEngine:
     def __init__(self):
