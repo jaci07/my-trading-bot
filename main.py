@@ -1,32 +1,24 @@
-# main.py
 import warnings
 import os
-
-# --- SILENCE THE NOISE ---
-# Diese Filter müssen VOR allen anderen Importen stehen!
 warnings.filterwarnings("ignore")
 os.environ["PYTHONWARNINGS"] = "ignore"
 
-# main.py
 import time
 import sys
 from datetime import datetime
 import pytz
 import pandas as pd
-#import yfinance as yf 
 import json
 from mt5_handler import MT5Handler
 from infrastructure import DatabaseHandler, VolumeProfileEngine, AIEngine, log, timedelta
 from risk_manager import RiskManager
 from settings import cfg
 import numpy as np
-from advanced_engine import AdvancedMarketEngine # <--- NEU
+from advanced_engine import AdvancedMarketEngine 
 import joblib
-# Unterdrückt die nervigen Parallel-Warnungen
 warnings.filterwarnings("ignore", category=UserWarning, module="sklearn.utils.parallel")
 warnings.filterwarnings("ignore", message=".*sklearn.utils.parallel.delayed.*")
 
-# Optional: Unterdrückt TensorFlow/System Warnungen falls vorhanden
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 
 class EnterpriseBot:
