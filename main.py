@@ -290,7 +290,7 @@ class EnterpriseBot:
                 
                 # FIX: Dynamischer Puffer basierend auf Punktewert (funktioniert bei JPY, EUR, Krypto)
                 point = self.mt5.mt5.symbol_info(symbol).point
-                BUFFER = point * 30 # 30 Points = exakt 3 Pips Abstand
+                BUFFER = point * 50 # 30 Points = exakt 3 Pips Abstand
 
                 # LVA vorbereiten (Nur wenn über 50%, spart CPU)
                 lva = None
@@ -495,7 +495,49 @@ class EnterpriseBot:
             return account_data["start_balance"]
 
     
+    def check_symbol_direction_clear(self, symbol, intended_direction):
+        """Prevents hedging (LONG and SHORT at the same time) on the same symbol."""
+        positions = self.mt5.mt5.positions_get(symbol=symbol)
+        if positions is None or len(positions) == 0:
+            return True 
+            
+        for pos in positions:
+            if intended_direction == "LONG" and pos.type == self.mt5.mt5.POSITION_TYPE_SELL:
+                return False 
+            if intended_direction == "SHORT" and pos.type == self.mt5.mt5.POSITION_TYPE_BUY:
+                return False 
+                
+        return True 
 
+    def is_currency_exposure_safe(self, new_symbol, new_direction):
+        """Prevents synthetic hedging (e.g., buying CAD and selling CAD on different pairs)."""
+        base_curr = new_symbol[:3]
+        quote_curr = new_symbol[3:]
+        
+        new_exposure = {
+            base_curr: 1 if new_direction == "LONG" else -1,
+            quote_curr: -1 if new_direction == "LONG" else 1
+        }
+        
+        positions = self.mt5.mt5.positions_get()
+        if not positions: return True
+        
+        for pos in positions:
+            open_base = pos.symbol[:3]
+            open_quote = pos.symbol[3:]
+            open_dir = "LONG" if pos.type == self.mt5.mt5.POSITION_TYPE_BUY else "SHORT"
+            
+            open_exposure = {
+                open_base: 1 if open_dir == "LONG" else -1,
+                open_quote: -1 if open_dir == "LONG" else 1
+            }
+            
+            for currency in [base_curr, quote_curr]:
+                if currency in open_exposure:
+                    if open_exposure[currency] != new_exposure[currency]:
+                        return False 
+                        
+        return True
     # --- DEINE HAUPTSCHLEIFE (MIT REMOTE CONTROL INTEGRIERT) ---
     # --- DEINE HAUPTSCHLEIFE (KORRIGIERT & FINAL) ---
     def run_strategy_loop(self):
@@ -747,9 +789,9 @@ class EnterpriseBot:
                             continue
 
                         # --- 4. TECHNISCHES SETUP DA? ---
-                        #if not direction:
+                        if not direction:
                             #print("no direction")
-                        #    continue 
+                            continue 
                         
                         # --- 5. KI FÜR M1 BEFRAGEN & AUTO-TRAINING ---
                         ai_m1 = self.ai.get_ai_prediction(symbol, df_m1, tf_name="M1")
@@ -771,8 +813,8 @@ class EnterpriseBot:
                             score_m5, score_m1 = ai_m5['short'], ai_m1['short']
 
                         # --- 7. KI-SCHWELLENWERT (Dual-Threshold) ---
-                        THRESHOLD_M5, THRESHOLD_M1 = 0.70, 0.70 
-                        print(f"🔍 [{symbol}] M5: {score_m5:.2f}, M1: {score_m1:.2f}")
+                        THRESHOLD_M5, THRESHOLD_M1 = 0.60, 0.60 
+                        #print(f"🔍 [{symbol}] M5: {score_m5:.2f}, M1: {score_m1:.2f}")
                         if score_m5 < THRESHOLD_M5 or score_m1 < THRESHOLD_M1:   
                             continue
                         
@@ -828,7 +870,7 @@ class EnterpriseBot:
                         vwap = self.vp_engine.calculate_vwap(df_m5)
                         zone_tolerance = current_atr * 0.5
 
-                        log.info(f"🔎 [{symbol}] Filter bestanden | M5-AI:{score_m5:.2f} | M1-AI:{score_m1:.2f} | POC:{poc:.2f}")
+                        log.info(f"🔎 [{symbol}] Filter bestanden | M5-AI:{score_m5:.2f} | M1-AI:{score_m1:.2f} | POC:{poc:.2f} | DDirection:{direction}")
 
                         signal = None
                         
@@ -930,6 +972,16 @@ class EnterpriseBot:
 
                         # --- EXECUTION ---
                         if signal:
+                            # 1. Hedging Check (Issue #3)
+                            if not self.check_symbol_direction_clear(symbol, signal['side']):
+                                log.warning(f"🛡️ Trade blocked: Opposing trade already open for {symbol}.")
+                                continue
+                            
+                            # 2. Exposure Check (Issue #4)
+                            if not self.is_currency_exposure_safe(symbol, signal['side']):
+                                log.warning(f"🛡️ Trade blocked: Currency exposure conflict for {symbol}.")
+                                continue
+
                             shares = 0 
                             valid_sl = False
                             if signal['side'] == "LONG" and signal['sl'] < mid_price: valid_sl = True
