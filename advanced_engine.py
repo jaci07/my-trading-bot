@@ -370,38 +370,45 @@ class AdvancedMarketEngine:
             lower_wick = min(open_price, current_price) - df['low'].iloc[-1]
             body = abs(current_price - open_price)
 
+            # We widen the "hit box" to 25% of the ATR. This allows the bot to 
+            # register a touch even if it's off by a fraction of a pip (like on TradingView).
+            zone = atr * 0.25
+
             # --- B) STRATEGIE: OBERE KANTE (VAH) ---
-            if current_price >= (vah - (atr * 0.1)):
-                # 1. BREAKOUT (Momentum nach oben)
-                if current_price > open_price and (current_price > vah + (atr * 0.1)):
-                    # Optimierung: Nur traden, wenn Volumen den Ausbruch stützt
+            # Did the HIGH of the candle touch the VAH zone? (Matches human eye)
+            if df['high'].iloc[-1] >= (vah - zone):
+                
+                # 1. BREAKOUT (Momentum up)
+                # Candle is green and CLOSED above the VAH
+                if current_price > open_price and current_price > vah:
                     if vol_confirmed:
-                        # Vakuum-Check: Haben wir Platz bis zum nächsten LVA-Widerstand?
                         lva_above = vp_engine.find_nearest_lva(df, current_price, direction="UP")
                         if lva_above is None or (lva_above - current_price) > (atr * 0.8):
                             return "LONG", "Smart_VAH_Breakout_Confirmed"
                 
-                # 2. REJECTION (Abpraller nach unten)
-                prev_low = df['low'].iloc[-2]
-                if current_price < open_price and current_price < prev_low:
-                    # Optimierung: Bestätigung durch "Pin-Bar" Charakter (Docht oben)
+                # 2. REJECTION (Bounce down)
+                # Candle tested the VAH, but closed red and BELOW the VAH
+                if current_price < open_price and current_price < vah:
+                    # Confirmed by a top wick (price pushed up, sellers shoved it back down)
                     if upper_wick > (body * 0.5):
                         return "SHORT", "Smart_VAH_Rejection_Confirmed"
 
             # --- C) STRATEGIE: UNTERE KANTE (VAL) ---
-            elif current_price <= (val + (atr * 0.1)):
-                # 1. BREAKOUT (Momentum nach unten)
-                if current_price < open_price and (current_price < val - (atr * 0.1)):
-                    # Optimierung: Volumen-Bestätigung für den Verkaufsdruck
+            # Did the LOW of the candle touch the VAL zone? (Matches human eye)
+            elif df['low'].iloc[-1] <= (val + zone):
+                
+                # 1. BREAKOUT (Momentum down)
+                # Candle is red and CLOSED below the VAL
+                if current_price < open_price and current_price < val:
                     if vol_confirmed:
                         lva_below = vp_engine.find_nearest_lva(df, current_price, direction="DOWN")
                         if lva_below is None or (current_price - lva_below) > (atr * 0.8):
                             return "SHORT", "Smart_VAL_Breakout_Confirmed"
                 
-                # 2. REJECTION (Abpraller nach oben)
-                prev_high = df['high'].iloc[-2]
-                if current_price > open_price and current_price > prev_high:
-                    # Optimierung: Bestätigung durch "Hammer" Charakter (Docht unten)
+                # 2. REJECTION (Bounce up)
+                # Candle tested the VAL, but closed green and ABOVE the VAL
+                if current_price > open_price and current_price > val:
+                    # Confirmed by a bottom wick (price pushed down, buyers stepped in)
                     if lower_wick > (body * 0.5):
                         return "LONG", "Smart_VAL_Rejection_Confirmed"
 
