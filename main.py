@@ -924,51 +924,45 @@ class EnterpriseBot:
                                 else: best_tp = entry - (risk * 2.0)
                             return best_tp
 
-                        # --- SETUP SUCHE ---
-                        recent_close = df_m5['close'].iloc[-1]
-
-                        # 1. SETUP: VAH Breakout
-                        if recent_close > (vah + zone_tolerance) and recent_close > vwap:
-                            if not self.db.has_traded_today(symbol, "VAH_Break"):
-                                sl_price = vah - zone_tolerance
-                                final_sl = get_smart_sl("LONG", mid_price, lva_below, sl_price)
-                                if final_sl:
-                                    final_tp = get_logical_tp("LONG", mid_price, final_sl)
-                                    signal = {"side": "LONG", "tp": final_tp, "sl": final_sl, "setup": "VAH_Break_Smart"}
-
-                        # 2. SETUP: VAL Rejection
-                        elif (val - zone_tolerance) < df_m5['low'].iloc[-1] < (val + zone_tolerance) and recent_close > val:
-                            if not self.db.has_traded_today(symbol, "VAL_Rej"):
-                                 sl_price = df_m5['low'].iloc[-1] - zone_tolerance
-                                 final_sl = get_smart_sl("LONG", mid_price, lva_below, sl_price)
-                                 if final_sl:
-                                     final_tp = get_logical_tp("LONG", mid_price, final_sl)
-                                     signal = {"side": "LONG", "tp": final_tp, "sl": final_sl, "setup": "VAL_Rej_Smart"}
-
-                        # 3. SETUP: VAH Rejection (Short)
-                        elif (vah - zone_tolerance) < df_m5['high'].iloc[-1] < (vah + zone_tolerance) and recent_close < vah:
-                            if not self.db.has_traded_today(symbol, "VAH_Rej"):
-                                sl_price = df_m5['high'].iloc[-1] + zone_tolerance
-                                final_sl = get_smart_sl("SHORT", mid_price, lva_above, sl_price)
-                                if final_sl:
-                                    final_tp = get_logical_tp("SHORT", mid_price, final_sl)
-                                    signal = {"side": "SHORT", "tp": final_tp, "sl": final_sl, "setup": "VAH_Rej_Smart"}
-
-                        # 4. SETUP: POC Bounce
-                        elif abs(mid_price - poc) < zone_tolerance:
-                            if df_m5['low'].iloc[-1] <= poc and recent_close > poc and mid_price > vwap:
-                                if not self.db.has_traded_today(symbol, "POC_Bounce_Long"):
-                                    final_sl = get_smart_sl("LONG", mid_price, lva_below, poc - zone_tolerance)
-                                    if final_sl:
-                                        final_tp = get_logical_tp("LONG", mid_price, final_sl)
-                                        signal = {"side": "LONG", "tp": final_tp, "sl": final_sl, "setup": "POC_Bounce_Smart"}
+                        # --- SETUP SUCHE (Trusting the Advanced Engine) ---
+                        signal = None
+                        
+                        # We only proceed if advanced_engine actually found a valid setup!
+                        if direction and strategy_name:
                             
-                            elif df_m5['high'].iloc[-1] >= poc and recent_close < poc and mid_price < vwap:
-                                if not self.db.has_traded_today(symbol, "POC_Bounce_Short"):
-                                    final_sl = get_smart_sl("SHORT", mid_price, lva_above, poc + zone_tolerance)
-                                    if final_sl:
-                                        final_tp = get_logical_tp("SHORT", mid_price, final_sl)
-                                        signal = {"side": "SHORT", "tp": final_tp, "sl": final_sl, "setup": "POC_Bounce_Smart"}
+                            # 1. Check if we already traded this setup today (Cooldown)
+                            if self.db.has_traded_today(symbol, strategy_name):
+                                log.info(f"⏳ {symbol}: Setup '{strategy_name}' already traded today. Skipping.")
+                                continue
+
+                            # 2. Determine the Base Stop Loss depending on the setup type
+                            base_sl = mid_price # Fallback
+                            if "VAH" in strategy_name and "Breakout" in strategy_name:
+                                base_sl = vah - zone_tolerance
+                            elif "VAL" in strategy_name and "Breakout" in strategy_name:
+                                base_sl = val + zone_tolerance
+                            elif "VAH" in strategy_name and "Rejection" in strategy_name:
+                                base_sl = df_m5['high'].iloc[-1] + zone_tolerance
+                            elif "VAL" in strategy_name and "Rejection" in strategy_name:
+                                base_sl = df_m5['low'].iloc[-1] - zone_tolerance
+                            elif "POC" in strategy_name:
+                                base_sl = poc - zone_tolerance if direction == "LONG" else poc + zone_tolerance
+                            else:
+                                # Safe fallback for any other AI strategies
+                                base_sl = df_m5['low'].iloc[-1] if direction == "LONG" else df_m5['high'].iloc[-1]
+
+                            # 3. Calculate Smart SL & TP using your inline functions
+                            lva_target = lva_below if direction == "LONG" else lva_above
+                            final_sl = get_smart_sl(direction, mid_price, lva_target, base_sl)
+                            
+                            if final_sl:
+                                final_tp = get_logical_tp(direction, mid_price, final_sl)
+                                signal = {
+                                    "side": direction, 
+                                    "tp": final_tp, 
+                                    "sl": final_sl, 
+                                    "setup": strategy_name
+                                }
 
                         # --- EXECUTION ---
                         if signal:
