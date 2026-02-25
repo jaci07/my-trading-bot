@@ -221,6 +221,7 @@ class EnterpriseBot:
         df_m5.set_index('time', inplace=True)
         return df_m5
 
+
     def manage_running_trades(self):
         """
         Verwaltet offene Trades.
@@ -267,9 +268,17 @@ class EnterpriseBot:
                 current_sl = pos.sl
                 tp_price = pos.tp
 
-                # Reverse Check
-                if self.check_stop_and_reverse(pos, current_price, symbol):
-                    continue 
+                # --- FIX: LIVE SIGNAL FÜR STOP & REVERSE HOLEN ---
+                current_signal = None
+                df_m5_live = self.fetch_candles(symbol, self.mt5.mt5.TIMEFRAME_M5)
+                
+                if df_m5_live is not None and not df_m5_live.empty:
+                    # Wir fragen die Strategie-Engine nach der AKTUELLEN Richtung
+                    current_signal, _ = self.adv_engine.check_entry_signal(symbol, df_m5_live, self.vp_engine)
+
+                # Reverse Check (Jetzt MIT dem Live-Signal übergeben)
+                if self.check_stop_and_reverse(pos, current_price, symbol, current_signal):
+                    continue
                 
                 if tp_price == 0: continue
 
@@ -485,6 +494,8 @@ class EnterpriseBot:
         else:
             return account_data["start_balance"]
 
+    
+
     # --- DEINE HAUPTSCHLEIFE (MIT REMOTE CONTROL INTEGRIERT) ---
     # --- DEINE HAUPTSCHLEIFE (KORRIGIERT & FINAL) ---
     def run_strategy_loop(self):
@@ -695,7 +706,7 @@ class EnterpriseBot:
                         mid_price_temp = (tick.ask + tick.bid) / 2
                         spread_pct = (current_spread / mid_price_temp) * 100
                         
-                        # Erlaubt maximal 0.15% Spread (Perfekt für Forex, Krypto & Gold)
+                        # Erlaubt maximal 0.10% Spread (Perfekt für Forex, Krypto & Gold)
                         MAX_SPREAD_PCT = 0.1 
                         
                         if spread_pct > MAX_SPREAD_PCT: 
@@ -727,16 +738,18 @@ class EnterpriseBot:
                         elif best_prob == ai_m5['short']: trend = "SHORT"
                         else: trend = "NIX "
 
-                        print(f"🔎 [{symbol}] Preis:{mid_price:.5f} | AI-Trend ({trend}): {best_prob:.2f} | Strat: {strat_display}")
+                        #print(f"🔎 [{symbol}] Preis:{mid_price:.5f} | AI-Trend ({trend}): {best_prob:.2f} | Strat: {strat_display}")
 
                         # --- 3. MARKT-FILTER (Velocity) ---
                         velocity = self.adv_engine.get_tick_velocity(symbol)
                         if velocity > 8.0: 
+                            #print("no velocity")
                             continue
 
                         # --- 4. TECHNISCHES SETUP DA? ---
-                        if not direction:
-                            continue 
+                        #if not direction:
+                            #print("no direction")
+                        #    continue 
                         
                         # --- 5. KI FÜR M1 BEFRAGEN & AUTO-TRAINING ---
                         ai_m1 = self.ai.get_ai_prediction(symbol, df_m1, tf_name="M1")
@@ -758,8 +771,9 @@ class EnterpriseBot:
                             score_m5, score_m1 = ai_m5['short'], ai_m1['short']
 
                         # --- 7. KI-SCHWELLENWERT (Dual-Threshold) ---
-                        THRESHOLD_M5, THRESHOLD_M1 = 0.60, 0.60 
-                        if score_m5 < THRESHOLD_M5 or score_m1 < THRESHOLD_M1:
+                        THRESHOLD_M5, THRESHOLD_M1 = 0.70, 0.70 
+                        print(f"🔍 [{symbol}] M5: {score_m5:.2f}, M1: {score_m1:.2f}")
+                        if score_m5 < THRESHOLD_M5 or score_m1 < THRESHOLD_M1:   
                             continue
                         
                         # ==========================================
