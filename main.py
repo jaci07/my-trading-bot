@@ -399,41 +399,36 @@ class EnterpriseBot:
                 log.error(f"Konnte Switch nicht ausführen (Close failed): {res.comment}")
                 return False
 
-            # 2. Neuen Trade öffnen (Dein bestehender Code für vol, sl_dist, tp_dist etc.)
+                        # --- 3. SMART SL & TP FÜR DEN REVERSE TRADE ---
             vol = pos.volume * MULTIPLIER
-            sl_dist = 0.0020 * current_price 
-            tp_dist = 0.0040 * current_price 
             
+            # 1. Frische Chartdaten holen, um die echten Volume-Wände zu sehen
+            df_m5 = self.fetch_candles(symbol, self.mt5.mt5.TIMEFRAME_M5)
+            lva_above = self.vp_engine.find_nearest_lva(df_m5, current_price, direction="UP")
+            lva_below = self.vp_engine.find_nearest_lva(df_m5, current_price, direction="DOWN")
+            
+            # 2. Smart Berechnung exakt wie beim normalen Trade
             if new_side == "LONG":
-                new_sl = current_price - sl_dist
-                new_tp = current_price + tp_dist
-                order_type = self.mt5.mt5.ORDER_TYPE_BUY
-                price_open = self.mt5.mt5.symbol_info_tick(symbol).ask
+                # SL sicher unter die LVA legen, TP an die LVA darüber
+                new_sl = lva_below if (lva_below and lva_below < current_price) else current_price * 0.998
+                risk = current_price - new_sl
+                new_tp = lva_above if (lva_above and lva_above > current_price) else current_price + (risk * 2.0)
             else:
-                new_sl = current_price + sl_dist
-                new_tp = current_price - tp_dist
-                order_type = self.mt5.mt5.ORDER_TYPE_SELL
-                price_open = self.mt5.mt5.symbol_info_tick(symbol).bid
+                # SL sicher über die LVA legen, TP an die LVA darunter
+                new_sl = lva_above if (lva_above and lva_above > current_price) else current_price * 1.002
+                risk = new_sl - current_price
+                new_tp = lva_below if (lva_below and lva_below < current_price) else current_price - (risk * 2.0)
 
-            req_new = {
-                "action": self.mt5.mt5.TRADE_ACTION_DEAL,
-                "symbol": symbol,
-                "volume": vol,
-                "type": order_type,
-                "price": price_open,
-                "sl": new_sl,
-                "tp": new_tp,
-                "magic": 234000,
-                "comment": "REVERSE Entry", 
-                "type_time": self.mt5.mt5.ORDER_TIME_GTC,
-                "type_filling": self.mt5.mt5.ORDER_FILLING_IOC,
-            }
+            # 3. Trade absenden
+            success = self.mt5.submit_order(symbol, new_side, vol, new_sl, new_tp, "REVERSE_SMART")
             
-            self.mt5.mt5.order_send(req_new)
-            log.info(f"✅ REVERSE SUCCESS: {symbol} jetzt {new_side}")
-            return True
-            
-        return False
+            if success:
+                log.info(f"✅ REVERSE SUCCESS: {symbol} jetzt {new_side} | Smart TP: {new_tp:.5f}")
+                return True
+            else:
+                log.error(f"❌ REVERSE ENTRY FEHLGESCHLAGEN: MT5 hat den neuen Trade abgelehnt!")
+                return False
+
 
     # --- HELPER FÜR DISCORD & SNAPSHOT ---
     def load_settings(self):
